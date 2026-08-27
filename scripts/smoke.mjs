@@ -3,7 +3,7 @@
  * microphone or Gemini API key (#1 partial, #6, #7, #8, snapshot-on-join).
  * Run: node scripts/smoke.mjs
  */
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
@@ -19,22 +19,34 @@ const DATA = path.join(ROOT, 'data', 'smoke');
 
 const env = {
   ...process.env,
+  NODE_ENV: 'test',
+  HOST: '127.0.0.1',
   PORT: String(PORT),
   ADMIN_SECRET: SECRET,
   GEMINI_API_KEY: 'fake-key-for-smoke-test',
   DATABASE_PATH: path.join(DATA, 'app.db'),
   UPLOADS_DIR: path.join(DATA, 'uploads'),
   PUBLIC_ORIGIN: '',
+  TRUST_PROXY: 'false',
+  SENTRY_DSN: '',
+  ENABLE_TEST_HOOKS: 'false',
+  AUDIO_SYNC_METADATA: 'false',
   AUDIO_SUBSCRIPTION_ACTIVE: 'false',
   CF_REALTIME_APP_ID: '',
   CF_REALTIME_APP_SECRET: '',
+  CF_REALTIME_APP_TOKEN: '',
   CF_REALTIME_API_BASE: '',
+  R2_ACCOUNT_ID: '',
+  R2_ACCESS_KEY_ID: '',
+  R2_SECRET_ACCESS_KEY: '',
+  R2_BUCKET: '',
   R2_PUBLIC_BASE_URL: '',
   R2_CACHE_PURGE_BASE_URLS: '',
   R2_CACHE_PURGE_ZONE_ID: '',
   R2_CACHE_PURGE_API_TOKEN: '',
   ASSET_CDN_BASE_URL: '',
   MAX_VIEWERS_PER_SESSION: '500',
+  PUBLIC_GET_MAX: '2000',
 };
 
 let passed = 0;
@@ -469,17 +481,15 @@ console.log('\n[0a] Legacy trial schema retirement');
       JSON.stringify(first.pendingSlideRefs) === JSON.stringify(['aaaaaaaaaaaa.pdf']),
       JSON.stringify(first.pendingSlideRefs)
     );
+    check(
+      'logical migration queues physical compaction without running it at startup',
+      openDb
+        .prepare("SELECT COUNT(*) AS count FROM database_maintenance_tasks WHERE task = 'retired_public_data_compaction'")
+        .get().count === 1
+    );
 
     openDb.close();
     openDb = null;
-    const compactedDbBytes = fs.readFileSync(legacyPath).toString('latin1');
-    check(
-      'migration compacts retired sensitive records out of SQLite',
-      !compactedDbBytes.includes('historical@example.com') &&
-        !compactedDbBytes.includes('historical audit') &&
-        (!fs.existsSync(`${legacyPath}-wal`) || fs.statSync(`${legacyPath}-wal`).size === 0),
-      'retired marker remained in the database or WAL'
-    );
 
     const second = initDb(legacyPath);
     openDb = second.database;
@@ -497,7 +507,10 @@ console.log('\n[0a] Legacy trial schema retirement');
         ]) &&
         secondChildCounts.every((count) => count === 1) &&
         !secondColumns.includes('is_trial') &&
-        !secondColumns.includes('trial_type'),
+        !secondColumns.includes('trial_type') &&
+        openDb
+          .prepare("SELECT COUNT(*) AS count FROM database_maintenance_tasks WHERE task = 'retired_public_data_compaction'")
+          .get().count === 1,
       JSON.stringify({ refs: second.pendingSlideRefs, secondSessions, secondChildCounts, secondColumns })
     );
     completePendingSlideDeletion('aaaaaaaaaaaa.pdf');
@@ -505,6 +518,291 @@ console.log('\n[0a] Legacy trial schema retirement');
       'completed slide cleanup is removed from the durable retry queue',
       openDb.prepare('SELECT COUNT(*) AS count FROM pending_slide_deletions').get().count === 0
     );
+    openDb.close();
+    openDb = null;
+
+    const compactOutput = execFileSync(
+      'node',
+      [path.join(ROOT, 'server/dist/compact.js')],
+      {
+        cwd: ROOT,
+        env: { ...env, DATABASE_PATH: legacyPath, UPLOADS_DIR: legacyDir },
+        encoding: 'utf8',
+      }
+    );
+    openDb = new Database(legacyPath, { readonly: true });
+    const compactedDbBytes = fs.readFileSync(legacyPath).toString('latin1');
+    check(
+      'offline maintenance compacts sensitive free pages and clears its task',
+      compactOutput.includes('"compacted":true') &&
+        openDb
+          .prepare("SELECT COUNT(*) AS count FROM database_maintenance_tasks WHERE task = 'retired_public_data_compaction'")
+          .get().count === 0 &&
+        !compactedDbBytes.includes('historical@example.com') &&
+        !compactedDbBytes.includes('historical audit'),
+      compactOutput.trim()
+    );
+    openDb.close();
+    openDb = null;
+
+    const emptyLegacyPath = path.join(legacyDir, 'empty-legacy.db');
+    initDb(emptyLegacyPath).database.close();
+    openDb = new Database(emptyLegacyPath);
+    openDb.exec(`
+      ALTER TABLE sessions ADD COLUMN is_trial INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE sessions ADD COLUMN trial_type TEXT;
+      CREATE TABLE beta_leads (id INTEGER PRIMARY KEY, email TEXT NOT NULL);
+    `);
+    openDb.close();
+    openDb = null;
+    const emptyUpgrade = initDb(emptyLegacyPath);
+    openDb = emptyUpgrade.database;
+    check(
+      'empty retired schema is removed without scheduling VACUUM',
+      openDb
+        .prepare("SELECT COUNT(*) AS count FROM database_maintenance_tasks WHERE task = 'retired_public_data_compaction'")
+        .get().count === 0
+    );
+    openDb.close();
+    openDb = null;
+
+    const isTrialOnlyPath = path.join(legacyDir, 'is-trial-only.db');
+    initDb(isTrialOnlyPath).database.close();
+    openDb = new Database(isTrialOnlyPath);
+    openDb.exec(`
+      ALTER TABLE sessions ADD COLUMN is_trial INTEGER NOT NULL DEFAULT 0;
+      INSERT INTO sessions (slug, title, target_lang, slide_type, slide_ref, is_trial)
+        VALUES ('is-trial-keep', 'Keep', 'es', 'pdf', 'normal-slide.pdf', 0),
+               ('is-trial-remove', 'Remove', 'es', 'pdf', 'cccccccccccc.pdf', 1);
+    `);
+    openDb.close();
+    openDb = null;
+    const isTrialOnlyUpgrade = initDb(isTrialOnlyPath);
+    openDb = isTrialOnlyUpgrade.database;
+    const isTrialOnlyColumns = openDb
+      .prepare('PRAGMA table_info(sessions)')
+      .all()
+      .map((column) => column.name);
+    check(
+      'is_trial-only legacy schema deletes marked sessions and migrates cleanly',
+      JSON.stringify(openDb.prepare('SELECT slug FROM sessions ORDER BY slug').all()) ===
+        JSON.stringify([{ slug: 'is-trial-keep' }]) &&
+        !isTrialOnlyColumns.includes('is_trial') &&
+        JSON.stringify(isTrialOnlyUpgrade.pendingSlideRefs) === JSON.stringify(['cccccccccccc.pdf']) &&
+        openDb
+          .prepare("SELECT COUNT(*) AS count FROM database_maintenance_tasks WHERE task = 'retired_public_data_compaction'")
+          .get().count === 1,
+      JSON.stringify({ columns: isTrialOnlyColumns, refs: isTrialOnlyUpgrade.pendingSlideRefs })
+    );
+    openDb.close();
+    openDb = null;
+
+    const trialTypeOnlyPath = path.join(legacyDir, 'trial-type-only.db');
+    initDb(trialTypeOnlyPath).database.close();
+    openDb = new Database(trialTypeOnlyPath);
+    openDb.exec(`
+      ALTER TABLE sessions ADD COLUMN trial_type TEXT;
+      INSERT INTO sessions (slug, title, target_lang, slide_type, slide_ref, trial_type)
+        VALUES ('trial-type-keep', 'Keep', 'es', 'pdf', 'normal-slide.pdf', NULL),
+               ('trial-type-remove', 'Remove', 'es', 'pdf', 'dddddddddddd.pdf', 'beta');
+    `);
+    openDb.close();
+    openDb = null;
+    const trialTypeOnlyUpgrade = initDb(trialTypeOnlyPath);
+    openDb = trialTypeOnlyUpgrade.database;
+    const trialTypeOnlyColumns = openDb
+      .prepare('PRAGMA table_info(sessions)')
+      .all()
+      .map((column) => column.name);
+    check(
+      'trial_type-only legacy schema deletes marked sessions and migrates cleanly',
+      JSON.stringify(openDb.prepare('SELECT slug FROM sessions ORDER BY slug').all()) ===
+        JSON.stringify([{ slug: 'trial-type-keep' }]) &&
+        !trialTypeOnlyColumns.includes('trial_type') &&
+        JSON.stringify(trialTypeOnlyUpgrade.pendingSlideRefs) === JSON.stringify(['dddddddddddd.pdf']) &&
+        openDb
+          .prepare("SELECT COUNT(*) AS count FROM database_maintenance_tasks WHERE task = 'retired_public_data_compaction'")
+          .get().count === 1,
+      JSON.stringify({ columns: trialTypeOnlyColumns, refs: trialTypeOnlyUpgrade.pendingSlideRefs })
+    );
+    openDb.close();
+    openDb = null;
+
+    const tablesOnlyPath = path.join(legacyDir, 'tables-only.db');
+    initDb(tablesOnlyPath).database.close();
+    openDb = new Database(tablesOnlyPath);
+    openDb.exec(`
+      INSERT INTO sessions (slug, title, target_lang, slide_type, slide_ref)
+        VALUES ('tables-only-keep', 'Keep', 'es', 'pdf', 'normal-slide.pdf');
+      CREATE TABLE beta_leads (id INTEGER PRIMARY KEY, email TEXT NOT NULL);
+      CREATE TABLE trial_rate_limits (scope TEXT NOT NULL, key_hash TEXT NOT NULL);
+      CREATE TABLE trial_abuse_events (id INTEGER PRIMARY KEY, detail TEXT NOT NULL);
+      INSERT INTO beta_leads (email) VALUES ('tables-only@example.invalid');
+    `);
+    openDb.close();
+    openDb = null;
+    const tablesOnlyUpgrade = initDb(tablesOnlyPath);
+    openDb = tablesOnlyUpgrade.database;
+    const tablesAfterUpgrade = new Set(
+      openDb.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((row) => row.name)
+    );
+    check(
+      'retired tables-only schema is scrubbed without deleting current sessions',
+      openDb.prepare('SELECT COUNT(*) AS count FROM sessions WHERE slug = ?').get('tables-only-keep').count === 1 &&
+        !tablesAfterUpgrade.has('beta_leads') &&
+        !tablesAfterUpgrade.has('trial_rate_limits') &&
+        !tablesAfterUpgrade.has('trial_abuse_events') &&
+        tablesOnlyUpgrade.pendingSlideRefs.length === 0 &&
+        openDb
+          .prepare("SELECT COUNT(*) AS count FROM database_maintenance_tasks WHERE task = 'retired_public_data_compaction'")
+          .get().count === 1,
+      JSON.stringify({ tables: [...tablesAfterUpgrade].sort(), refs: tablesOnlyUpgrade.pendingSlideRefs })
+    );
+    openDb.close();
+    openDb = null;
+
+    const currentPath = path.join(legacyDir, 'already-current.db');
+    openDb = initDb(currentPath).database;
+    openDb
+      .prepare(
+        `INSERT INTO sessions (slug, title, target_lang, slide_type, slide_ref)
+         VALUES (?, ?, 'es', 'pdf', ?)`
+      )
+      .run('current-keep', 'Current', 'normal-slide.pdf');
+    openDb.close();
+    openDb = null;
+    const currentUpgrade = initDb(currentPath);
+    openDb = currentUpgrade.database;
+    const currentColumns = openDb
+      .prepare('PRAGMA table_info(sessions)')
+      .all()
+      .map((column) => column.name);
+    check(
+      'already-current schema is a no-op with no cleanup or compaction',
+      openDb.prepare('SELECT COUNT(*) AS count FROM sessions WHERE slug = ?').get('current-keep').count === 1 &&
+        !currentColumns.includes('is_trial') &&
+        !currentColumns.includes('trial_type') &&
+        currentUpgrade.pendingSlideRefs.length === 0 &&
+        openDb
+          .prepare("SELECT COUNT(*) AS count FROM database_maintenance_tasks WHERE task = 'retired_public_data_compaction'")
+          .get().count === 0,
+      JSON.stringify({ columns: currentColumns, refs: currentUpgrade.pendingSlideRefs })
+    );
+    openDb.close();
+    openDb = null;
+
+    const lockedPath = path.join(legacyDir, 'locked-compaction.db');
+    openDb = initDb(lockedPath).database;
+    openDb
+      .prepare('INSERT INTO database_maintenance_tasks (task) VALUES (?)')
+      .run('retired_public_data_compaction');
+    openDb.exec('BEGIN EXCLUSIVE');
+    const lockedCompaction = spawnSync(
+      'node',
+      [path.join(ROOT, 'server/dist/compact.js')],
+      {
+        cwd: ROOT,
+        env: { ...env, DATABASE_PATH: lockedPath, UPLOADS_DIR: legacyDir },
+        encoding: 'utf8',
+        timeout: 10_000,
+      }
+    );
+    const retainedTask = openDb
+      .prepare("SELECT COUNT(*) AS count FROM database_maintenance_tasks WHERE task = 'retired_public_data_compaction'")
+      .get().count;
+    openDb.exec('ROLLBACK');
+    check(
+      'offline compaction lock failure is non-destructive and leaves its task queued',
+      lockedCompaction.status !== 0 && retainedTask === 1,
+      `${lockedCompaction.stdout}\n${lockedCompaction.stderr}`
+    );
+    openDb.close();
+    openDb = null;
+    const lockRetry = spawnSync(
+      'node',
+      [path.join(ROOT, 'server/dist/compact.js')],
+      {
+        cwd: ROOT,
+        env: { ...env, DATABASE_PATH: lockedPath, UPLOADS_DIR: legacyDir },
+        encoding: 'utf8',
+        timeout: 10_000,
+      }
+    );
+    openDb = new Database(lockedPath, { readonly: true });
+    const taskAfterLockRetry = openDb
+      .prepare("SELECT COUNT(*) AS count FROM database_maintenance_tasks WHERE task = 'retired_public_data_compaction'")
+      .get().count;
+    check(
+      'offline compaction succeeds on retry after the lock is released',
+      lockRetry.status === 0 && taskAfterLockRetry === 0,
+      `${lockRetry.stdout}\n${lockRetry.stderr}`
+    );
+    openDb.close();
+    openDb = null;
+
+    const insufficientPath = path.join(legacyDir, 'insufficient-space.db');
+    openDb = initDb(insufficientPath).database;
+    openDb
+      .prepare('INSERT INTO database_maintenance_tasks (task) VALUES (?)')
+      .run('retired_public_data_compaction');
+    openDb.pragma('wal_checkpoint(TRUNCATE)');
+    openDb.close();
+    openDb = null;
+    const compactDbBytes = fs.statSync(insufficientPath).size;
+    const diskStats = fs.statfsSync(legacyDir, { bigint: true });
+    const freeBytes = diskStats.bavail * diskStats.bsize;
+    const sparseBytes = freeBytes / 2n + 1024n * 1024n;
+    if (sparseBytes > BigInt(Number.MAX_SAFE_INTEGER)) {
+      check('offline compaction rejects insufficient free space without clearing its task', false, 'filesystem is too large for a safe sparse fixture');
+    } else {
+      fs.truncateSync(insufficientPath, Number(sparseBytes));
+      const insufficientCompaction = spawnSync(
+        'node',
+        [path.join(ROOT, 'server/dist/compact.js')],
+        {
+          cwd: ROOT,
+          env: { ...env, DATABASE_PATH: insufficientPath, UPLOADS_DIR: legacyDir },
+          encoding: 'utf8',
+          timeout: 10_000,
+        }
+      );
+      openDb = new Database(insufficientPath, { readonly: true });
+      const taskAfterSpaceFailure = openDb
+        .prepare("SELECT COUNT(*) AS count FROM database_maintenance_tasks WHERE task = 'retired_public_data_compaction'")
+        .get().count;
+      openDb.close();
+      openDb = null;
+      check(
+        'offline compaction rejects insufficient free space without clearing its task',
+        insufficientCompaction.status !== 0 &&
+          insufficientCompaction.stderr.includes('insufficient free space') &&
+          taskAfterSpaceFailure === 1,
+        `${insufficientCompaction.stdout}\n${insufficientCompaction.stderr}`
+      );
+
+      fs.truncateSync(insufficientPath, compactDbBytes);
+      const spaceRetry = spawnSync(
+        'node',
+        [path.join(ROOT, 'server/dist/compact.js')],
+        {
+          cwd: ROOT,
+          env: { ...env, DATABASE_PATH: insufficientPath, UPLOADS_DIR: legacyDir },
+          encoding: 'utf8',
+          timeout: 10_000,
+        }
+      );
+      openDb = new Database(insufficientPath, { readonly: true });
+      const taskAfterSpaceRetry = openDb
+        .prepare("SELECT COUNT(*) AS count FROM database_maintenance_tasks WHERE task = 'retired_public_data_compaction'")
+        .get().count;
+      check(
+        'offline compaction succeeds after free-space pressure is removed',
+        spaceRetry.status === 0 && taskAfterSpaceRetry === 0,
+        `${spaceRetry.stdout}\n${spaceRetry.stderr}`
+      );
+      openDb.close();
+      openDb = null;
+    }
   } finally {
     openDb?.close();
     fs.rmSync(legacyDir, { recursive: true, force: true });
@@ -592,6 +890,23 @@ console.log('\n[0b] R2 PDF deletion and cache retirement');
       JSON.stringify({ completed: [...completed], purgePrefixes })
     );
 
+    const commandCountBeforeInvalid = sentCommands.length;
+    const purgeCountBeforeInvalid = purgeCalls.length;
+    const invalidCompleted = await storage.removeMany([
+      'r2:assets/index.js',
+      'r2:slides/not-generated.pdf',
+      'r2:slides/../../shared.pdf',
+      'https://external.example.test/deck.pdf',
+    ]);
+    check(
+      'R2 cleanup rejects unmanaged keys while external URLs are safe no-ops',
+      invalidCompleted.size === 1 &&
+        invalidCompleted.has('https://external.example.test/deck.pdf') &&
+        sentCommands.length === commandCountBeforeInvalid &&
+        purgeCalls.length === purgeCountBeforeInvalid,
+      JSON.stringify({ completed: [...invalidCompleted] })
+    );
+
     console.warn = () => {};
     purgeCalls.length = 0;
     let purgeAttempt = 0;
@@ -610,7 +925,7 @@ console.log('\n[0b] R2 PDF deletion and cache retirement');
     };
     const bulkRefs = Array.from(
       { length: 51 },
-      (_, index) => `r2:slides/bulk-${String(index).padStart(2, '0')}.pdf`
+      (_, index) => `r2:slides/${String(index).padStart(12, '0')}.pdf`
     );
     const bulkCompleted = await storage.removeMany(bulkRefs);
     check(
@@ -627,6 +942,200 @@ console.log('\n[0b] R2 PDF deletion and cache retirement');
     globalThis.fetch = originalFetch;
     console.warn = originalWarn;
     fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
+// ---- Test 0c: finalized uploads remain durably queued when session creation fails.
+console.log('\n[0c] Failed create keeps durable deck cleanup');
+{
+  const Fastify = (await import('fastify')).default;
+  const fastifyMultipart = (await import('@fastify/multipart')).default;
+  const { initDb } = await import(path.join(ROOT, 'server/dist/db.js'));
+  const { registerRoutes } = await import(path.join(ROOT, 'server/dist/routes.js'));
+  const createFailureDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fluent-create-failure-'));
+  const createFailureDbPath = path.join(createFailureDir, 'app.db');
+  const createFailureUploads = path.join(createFailureDir, 'uploads');
+  const forcedRef = 'r2:slides/gggggggggggg.pdf';
+  let openDb = null;
+  let removeCalls = 0;
+  let wakeCalls = 0;
+  const app = Fastify({ logger: false });
+
+  try {
+    fs.mkdirSync(createFailureUploads, { recursive: true });
+    openDb = initDb(createFailureDbPath).database;
+    openDb.exec(`
+      CREATE TRIGGER force_session_insert_failure
+      BEFORE INSERT ON sessions
+      BEGIN
+        SELECT RAISE(ABORT, 'forced create failure');
+      END;
+    `);
+    await app.register(fastifyMultipart, { limits: { fileSize: 1024 * 1024, files: 1 } });
+    registerRoutes(app, {
+      ...env,
+      ADMIN_SECRET: SECRET,
+      PUBLIC_GET_MAX: 2000,
+      PUBLIC_ORIGIN: null,
+    }, {
+      slideStorage: {
+        mode: 'r2',
+        async uploadPdf(tmpPath) {
+          fs.rmSync(tmpPath, { force: true });
+          return forcedRef;
+        },
+        async readPdf() { return null; },
+        async remove() { removeCalls += 1; return removeCalls >= 2; },
+        async removeMany() { return new Set(); },
+        publicUrl() { return null; },
+      },
+      audioFanout: {
+        async checkSetup() { return { ok: false, checks: [] }; },
+        infoForSession() { return { available: false, reason: 'subscription_inactive' }; },
+        async subscribe() { throw new Error('not used'); },
+      },
+      wakeSlideCleanup() { wakeCalls += 1; },
+    });
+
+    const boundary = '----fluent-create-failure';
+    const multipart = Buffer.concat([
+      Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="title"\r\n\r\nForced failure\r\n` +
+        `--${boundary}\r\nContent-Disposition: form-data; name="targetLang"\r\n\r\nes\r\n` +
+        `--${boundary}\r\nContent-Disposition: form-data; name="slideType"\r\n\r\npdf\r\n` +
+        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="deck.pdf"\r\n` +
+        `Content-Type: application/pdf\r\n\r\n`
+      ),
+      Buffer.from(MINI_PDF),
+      Buffer.from(`\r\n--${boundary}--\r\n`),
+    ]);
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/sessions',
+      headers: {
+        authorization: `Bearer ${SECRET}`,
+        'content-type': `multipart/form-data; boundary=${boundary}`,
+      },
+      payload: multipart,
+    });
+    const queued = openDb
+      .prepare('SELECT COUNT(*) AS count FROM pending_slide_deletions WHERE slide_ref = ?')
+      .get(forcedRef).count;
+    check(
+      'failed DB insert queues uploaded deck when immediate removal fails',
+      response.statusCode === 500 && queued === 1 && removeCalls === 1 && wakeCalls === 1,
+      JSON.stringify({ status: response.statusCode, queued, removeCalls, wakeCalls })
+    );
+
+    openDb.exec(`
+      DROP TRIGGER force_session_insert_failure;
+      DELETE FROM pending_slide_deletions WHERE slide_ref = '${forcedRef}';
+      CREATE TRIGGER force_cleanup_queue_failure
+      BEFORE INSERT ON pending_slide_deletions
+      BEGIN
+        SELECT RAISE(ABORT, 'forced cleanup queue failure');
+      END;
+    `);
+    const queueFailureResponse = await app.inject({
+      method: 'POST',
+      url: '/api/sessions',
+      headers: {
+        authorization: `Bearer ${SECRET}`,
+        'content-type': `multipart/form-data; boundary=${boundary}`,
+      },
+      payload: multipart,
+    });
+    check(
+      'failed durable queue write still attempts immediate uploaded-deck removal',
+      queueFailureResponse.statusCode === 500 && removeCalls === 2,
+      JSON.stringify({ status: queueFailureResponse.statusCode, removeCalls })
+    );
+  } finally {
+    await app.close();
+    openDb?.close();
+    fs.rmSync(createFailureDir, { recursive: true, force: true });
+  }
+}
+
+// ---- Test 0d: durable cleanup retries serialize and recheck attachment.
+console.log('\n[0d] Serialized durable cleanup worker');
+{
+  const {
+    initDb,
+    queuePendingSlideDeletion,
+  } = await import(path.join(ROOT, 'server/dist/db.js'));
+  const { SlideCleanupWorker } = await import(path.join(ROOT, 'server/dist/slide-cleanup-worker.js'));
+  const workerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fluent-cleanup-worker-'));
+  let workerDb = null;
+  let active = 0;
+  let maxActive = 0;
+  let attempts = 0;
+  const logs = [];
+  try {
+    workerDb = initDb(path.join(workerDir, 'app.db')).database;
+    queuePendingSlideDeletion('hhhhhhhhhhhh.pdf');
+    const worker = new SlideCleanupWorker({
+      mode: 'local',
+      async uploadPdf() { throw new Error('not used'); },
+      async readPdf() { return null; },
+      async remove() { return false; },
+      async removeMany(refs) {
+        attempts += 1;
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        active -= 1;
+        return attempts === 1 ? new Set() : new Set(refs);
+      },
+      publicUrl() { return null; },
+    }, {
+      info(value) { logs.push(value); },
+      warn(value) { logs.push(value); },
+    }, 20);
+    worker.start();
+    worker.wake();
+    worker.wake();
+    const retried = await waitUntil(
+      () => workerDb.prepare('SELECT COUNT(*) AS count FROM pending_slide_deletions').get().count === 0,
+      1500
+    );
+    await worker.stop();
+    const attemptsAfterStop = attempts;
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    check(
+      'cleanup worker serializes wakeups and clears a first-failure on retry',
+      retried && attempts >= 2 && maxActive === 1 && attempts === attemptsAfterStop,
+      JSON.stringify({ retried, attempts, maxActive, logs })
+    );
+
+    queuePendingSlideDeletion('iiiiiiiiiiii.pdf');
+    workerDb.prepare(
+      `INSERT INTO sessions (slug, title, target_lang, slide_type, slide_ref, presentation_mode)
+       VALUES ('attached-during-cleanup', 'Attached', 'es', 'pdf', 'iiiiiiiiiiii.pdf', 'in_person')`
+    ).run();
+    let unsafeDeletes = 0;
+    const referenceWorker = new SlideCleanupWorker({
+      mode: 'local',
+      async uploadPdf() { throw new Error('not used'); },
+      async readPdf() { return null; },
+      async remove() { return false; },
+      async removeMany() { unsafeDeletes += 1; return new Set(); },
+      publicUrl() { return null; },
+    }, { info() {}, warn() {} }, 20);
+    referenceWorker.start();
+    const staleQueueCleared = await waitUntil(
+      () => workerDb.prepare('SELECT COUNT(*) AS count FROM pending_slide_deletions').get().count === 0,
+      500
+    );
+    await referenceWorker.stop();
+    check(
+      'cleanup worker rechecks references before touching storage',
+      staleQueueCleared && unsafeDeletes === 0,
+      JSON.stringify({ staleQueueCleared, unsafeDeletes })
+    );
+  } finally {
+    workerDb?.close();
+    fs.rmSync(workerDir, { recursive: true, force: true });
   }
 }
 
@@ -746,6 +1255,24 @@ console.log('\n[5] Numeric environment validation');
     `(code ${code})`
   );
 }
+{
+  const assetOnly = startServer({
+    ASSET_CDN_BASE_URL: 'https://assets.example.test',
+    R2_PUBLIC_BASE_URL: '',
+    R2_CACHE_PURGE_BASE_URLS: '',
+    R2_CACHE_PURGE_ZONE_ID: '',
+    R2_CACHE_PURGE_API_TOKEN: '',
+  });
+  let stderr = '';
+  assetOnly.stderr.on('data', (data) => (stderr += data));
+  const ready = await waitForHealth();
+  check(
+    'asset-only CDN does not require slide cache-purge credentials',
+    ready,
+    stderr
+  );
+  await stopProcess(assetOnly);
+}
 
 // ---- Test 6: secrets absent from client bundle (criterion #6)
 console.log('\n[6] No secrets in client bundle');
@@ -807,6 +1334,13 @@ console.log('\n[6] No secrets in client bundle');
 
 // ---- Boot the real server
 console.log('\n[7] HTTP auth (criterion #7)');
+{
+  const maintenanceDb = new Database(env.DATABASE_PATH);
+  maintenanceDb
+    .prepare('INSERT OR IGNORE INTO pending_slide_deletions (slide_ref) VALUES (?)')
+    .run('r2:slides/eeeeeeeeeeee.pdf');
+  maintenanceDb.close();
+}
 const server = startServer();
 server.stderr.on('data', (d) => process.env.SMOKE_DEBUG && console.error(String(d)));
 if (!(await waitForHealth())) {
@@ -827,15 +1361,31 @@ if (!(await waitForHealth())) {
     csp
   );
   check('healthz verifies runtime dependencies', health.ok && healthBody?.ok === true);
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  const maintenanceDb = new Database(env.DATABASE_PATH);
+  const pendingAfterBoot = maintenanceDb
+    .prepare('SELECT COUNT(*) AS count FROM pending_slide_deletions WHERE slide_ref = ?')
+    .get('r2:slides/eeeeeeeeeeee.pdf').count;
+  maintenanceDb
+    .prepare('DELETE FROM pending_slide_deletions WHERE slide_ref = ?')
+    .run('r2:slides/eeeeeeeeeeee.pdf');
+  maintenanceDb.close();
+  check(
+    'failed pending deck cleanup does not block health and remains durable',
+    health.ok && pendingAfterBoot === 1
+  );
 
-  const [retiredTry, retiredHostedCreation] = await Promise.all([
+  const retiredEndpoints = await Promise.all([
     fetch(`${BASE}/api/try`, { method: 'POST' }),
     fetch(`${BASE}/api/beta/trial`, { method: 'POST' }),
+    fetch(`${BASE}/api/beta/leads`),
+    fetch(`${BASE}/api/beta/trial/retired/expedite`, { method: 'POST' }),
+    fetch(`${BASE}/api/beta/trial/retired/feedback`, { method: 'POST' }),
   ]);
   check(
-    'retired public session-creation endpoints are unavailable',
-    retiredTry.status === 404 && retiredHostedCreation.status === 404,
-    `(got ${retiredTry.status} and ${retiredHostedCreation.status})`
+    'all retired public-session and lead endpoints are unavailable',
+    retiredEndpoints.every((response) => response.status === 404),
+    `(got ${retiredEndpoints.map((response) => response.status).join(', ')})`
   );
 
   // wrong key → 401
@@ -884,15 +1434,78 @@ let slug = '';
   const info = await (await fetch(`${BASE}/api/sessions/${slug}`)).json();
   check(
     'public session info has es/pdf and no secrets',
-    info.targetLang === 'es' &&
+      info.targetLang === 'es' &&
       info.slideType === 'pdf' &&
       !Object.hasOwn(info, 'resources') &&
+      !Object.hasOwn(info, 'trialKind') &&
+      !Object.hasOwn(info, 'trialRuntimeMs') &&
+      !Object.hasOwn(info, 'trialMaxViewers') &&
+      !Object.hasOwn(info, 'hostToken') &&
       !JSON.stringify(info).includes(SECRET)
   );
   check(
     'public session info marks audio unavailable when the operator gate is off',
     info.audio?.available === false && info.audio?.reason === 'subscription_inactive',
     JSON.stringify(info.audio)
+  );
+  const retiredTokenAnalytics = await fetch(`${BASE}/api/sessions/${slug}/analytics`, {
+    headers: { Authorization: 'Bearer retired-session-host-token' },
+  });
+  check(
+    'retired per-session host tokens cannot authorize analytics',
+    retiredTokenAnalytics.status === 401,
+    `(got ${retiredTokenAnalytics.status})`
+  );
+
+  const deleteFixtureDb = new Database(env.DATABASE_PATH);
+  deleteFixtureDb.prepare(
+    `INSERT INTO sessions (slug, title, target_lang, slide_type, slide_ref, presentation_mode)
+     VALUES (?, ?, 'es', 'pdf', ?, 'in_person')`
+  ).run('shared-delete-a', 'Shared delete A', 'ssssssssssss.pdf');
+  deleteFixtureDb.prepare(
+    `INSERT INTO sessions (slug, title, target_lang, slide_type, slide_ref, presentation_mode)
+     VALUES (?, ?, 'es', 'pdf', ?, 'in_person')`
+  ).run('shared-delete-b', 'Shared delete B', 'ssssssssssss.pdf');
+  deleteFixtureDb.prepare(
+    `INSERT INTO sessions (slug, title, target_lang, slide_type, slide_ref, presentation_mode)
+     VALUES (?, ?, 'es', 'pdf', ?, 'in_person')`
+  ).run('failed-r2-delete', 'Failed R2 delete', 'r2:slides/ffffffffffff.pdf');
+  deleteFixtureDb.close();
+
+  const sharedDelete = await fetch(`${BASE}/api/sessions/shared-delete-a`, {
+    method: 'DELETE',
+    headers: { Authorization: `Bearer ${SECRET}` },
+  });
+  const sharedDeleteBody = await sharedDelete.json();
+  check(
+    'DELETE returns 200 when a shared deck must be retained',
+    sharedDelete.status === 200 && sharedDeleteBody.cleanupPending === false,
+    `(status ${sharedDelete.status}, body ${JSON.stringify(sharedDeleteBody)})`
+  );
+
+  const failedStorageDelete = await fetch(`${BASE}/api/sessions/failed-r2-delete`, {
+    method: 'DELETE',
+    headers: { Authorization: `Bearer ${SECRET}` },
+  });
+  const failedStorageDeleteBody = await failedStorageDelete.json();
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const deletedInfo = await fetch(`${BASE}/api/sessions/failed-r2-delete`);
+  const queuedDeleteDb = new Database(env.DATABASE_PATH);
+  const failedDeleteQueued = queuedDeleteDb
+    .prepare('SELECT COUNT(*) AS count FROM pending_slide_deletions WHERE slide_ref = ?')
+    .get('r2:slides/ffffffffffff.pdf').count;
+  queuedDeleteDb.prepare('DELETE FROM sessions WHERE slug = ?').run('shared-delete-b');
+  queuedDeleteDb
+    .prepare('DELETE FROM pending_slide_deletions WHERE slide_ref = ?')
+    .run('r2:slides/ffffffffffff.pdf');
+  queuedDeleteDb.close();
+  check(
+    'DELETE returns 202 after DB success when deck cleanup must retry',
+    failedStorageDelete.status === 202 &&
+      failedStorageDeleteBody.cleanupPending === true &&
+      deletedInfo.status === 404 &&
+      failedDeleteQueued === 1,
+    `(status ${failedStorageDelete.status}, body ${JSON.stringify(failedStorageDeleteBody)}, queued ${failedDeleteQueued})`
   );
   const audioSub = await fetch(`${BASE}/api/sessions/${slug}/audio/subscribe`, {
     method: 'POST',
@@ -999,6 +1612,16 @@ let slug = '';
   const externalHtmlBody = await externalHtmlRes.json();
   const externalHtmlInfo = await (await fetch(`${BASE}/api/sessions/${externalHtmlBody.slug}`)).json();
   check('external HTML deck URL is accepted', externalHtmlRes.ok && externalHtmlInfo.slideUrl === 'https://example.com/deck.html');
+  const externalHtmlDelete = await fetch(`${BASE}/api/sessions/${externalHtmlBody.slug}`, {
+    method: 'DELETE',
+    headers: { Authorization: `Bearer ${SECRET}` },
+  });
+  const externalHtmlDeleteBody = await externalHtmlDelete.json();
+  check(
+    'DELETE returns 200 when an external deck needs no storage cleanup',
+    externalHtmlDelete.status === 200 && externalHtmlDeleteBody.cleanupPending === false,
+    `(status ${externalHtmlDelete.status}, body ${JSON.stringify(externalHtmlDeleteBody)})`
+  );
 
   const sameOriginHtml = new FormData();
   sameOriginHtml.set('title', 'Same Origin HTML Deck');
@@ -1038,7 +1661,18 @@ console.log('\n[9] WebSocket roles');
 {
   const viewer = await wsOpen(slug, { role: 'viewer' });
   const snap = viewer.messages.find((m) => m.type === 'snapshot');
-  check('viewer receives snapshot on connect', !!snap && snap.payload.state === 'created' && snap.payload.slideIndex === 0);
+  check(
+    'viewer receives an authoritative read-only snapshot',
+    !!snap && snap.payload.state === 'created' && snap.payload.slideIndex === 0 && snap.payload.canPresent === false
+  );
+
+  const rejectedPresenter = await wsOpen(slug, { role: 'viewer', auth: 'wrong-presenter-key' });
+  const rejectedPresenterSnap = rejectedPresenter.messages.find((m) => m.type === 'snapshot');
+  check(
+    'invalid presenter key stays connected but is authoritatively read-only',
+    rejectedPresenterSnap?.payload.canPresent === false && rejectedPresenter.closeCode() === null
+  );
+  rejectedPresenter.ws.close();
 
   viewer.ws.send(JSON.stringify({ type: 'slide.change', ts: 0, seq: 0, payload: { index: 5 } }));
   await new Promise((r) => setTimeout(r, 500));
@@ -1048,13 +1682,25 @@ console.log('\n[9] WebSocket roles');
   check('host with wrong secret is rejected (4401)', badHost.closeCode() === 4401, `(close ${badHost.closeCode()})`);
 
   const host = await wsOpen(slug, { role: 'host', auth: SECRET });
-  check('host with correct secret gets snapshot', host.messages.some((m) => m.type === 'snapshot'));
+  check(
+    'host with correct secret gets presenter capability',
+    host.messages.some((m) => m.type === 'snapshot' && m.payload.canPresent === true)
+  );
 
   const removedResourceRole = await wsOpen(slug, { role: 'resource' });
   check('removed resource role is rejected', removedResourceRole.closeCode() === 4403, `(close ${removedResourceRole.closeCode()})`);
 
   // host changes slide → late-joining viewer lands on it (criterion #3, late join)
   const viewer2 = await wsOpen(slug, { role: 'viewer' });
+  const presenter = await wsOpen(slug, { role: 'viewer', auth: SECRET });
+  const presenterSnap = presenter.messages.find((m) => m.type === 'snapshot');
+  check('valid presenter key receives server-granted controls', presenterSnap?.payload.canPresent === true);
+  presenter.ws.send(JSON.stringify({ type: 'slide.change', ts: 0, seq: 0, payload: { index: 1 } }));
+  await new Promise((r) => setTimeout(r, 200));
+  check(
+    'authenticated presenter can change slides',
+    viewer2.messages.some((m) => m.type === 'slide.change' && m.payload.index === 1)
+  );
   host.ws.send(JSON.stringify({
     type: 'poll.open',
     ts: 0,
@@ -1063,8 +1709,10 @@ console.log('\n[9] WebSocket roles');
   }));
   host.ws.send(JSON.stringify({ type: 'slide.change', ts: 0, seq: 0, payload: { index: 2 } }));
   await new Promise((r) => setTimeout(r, 400));
-  const slideMsg = viewer2.messages.find((m) => m.type === 'slide.change');
-  check('viewer receives slide.change from host', slideMsg?.payload.index === 2);
+  const hostSlideReceived = viewer2.messages.some(
+    (m) => m.type === 'slide.change' && m.payload.index === 2
+  );
+  check('viewer receives slide.change from host', hostSlideReceived);
   const lateViewer = await wsOpen(slug, { role: 'viewer' });
   const lateSnap = lateViewer.messages.find((m) => m.type === 'snapshot');
   check('late joiner lands on slide 3 (index 2)', lateSnap?.payload.slideIndex === 2);
@@ -1073,6 +1721,7 @@ console.log('\n[9] WebSocket roles');
   check('host receives presence (viewer count)', !!presence);
 
   host.ws.close();
+  presenter.ws.close();
   viewer2.ws.close();
   lateViewer.ws.close();
 
@@ -1088,6 +1737,21 @@ console.log('\n[9] WebSocket roles');
   check('host socket survives a bad frame and keeps streaming', audioHost.closeCode() === null, `(close ${audioHost.closeCode()})`);
   audioHost.ws.close();
   await new Promise((r) => setTimeout(r, 300));
+
+  // Two failures were recorded above (invalid presenter + invalid host). Reach
+  // the five-failure boundary with nonempty presenter credentials, then prove
+  // the next attempt is rejected while ordinary display-only viewers remain
+  // outside the auth limiter.
+  for (let i = 0; i < 3; i++) {
+    const invalidStage = await wsOpen(slug, { role: 'viewer', auth: `wrong-stage-key-${i}` });
+    invalidStage.ws.close();
+  }
+  const limitedStage = await wsOpen(slug, { role: 'viewer', auth: 'wrong-stage-key-limited' });
+  check(
+    'invalid presenter credentials share the per-IP auth rate limit',
+    limitedStage.closeCode() === 4429,
+    `(close ${limitedStage.closeCode()})`
+  );
 }
 
 // ---- Test 9b: 500 audience control sockets do not receive app-WS audio payloads

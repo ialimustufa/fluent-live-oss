@@ -40,7 +40,7 @@ not silently diverge.
 | Evaluation media | `evaluation/corpus/`, results, reviewer packets, SFU captures | Use synthetic or explicitly licensed fixtures only in the public repository. |
 | Generated builds | `client/dist/`, `server/dist/` | Rebuild from public source. Client bundles can contain `VITE_*` deployment values. |
 | Logs and diagnostics | service logs, browser traces, screenshots, crash reports | Remove tokens, session slugs, names, emails, transcripts, and request bodies. |
-| Backups | local and `/data/backups/` | Full SQLite and upload copies can outlive primary-data deletion. Encrypt, restrict, expire, and include them in deletion procedures. |
+| Backups | local and `/data/backups/`; separately managed R2 snapshots/exports | SQLite and local-upload copies do not include R2. Every copy can outlive primary-data deletion; encrypt, restrict, expire, and include it in deletion procedures. |
 | Machine configuration | `.claude/`, editor files, absolute paths | Remove unless the file is portable and intentionally documented. |
 | Git metadata | `.git/`, remotes, refs, commit authors | Do not copy into a fresh public mirror. Review any history before publishing it. |
 

@@ -23,7 +23,7 @@ export interface ControlPayload {
 }
 export interface HelloPayload {
   role: 'host' | 'viewer';
-  auth?: string; // ADMIN_SECRET for host sockets — handshake message, never a URL param
+  auth?: string; // ADMIN_SECRET for host/presenter sockets — handshake message, never a URL param
   // Viewer onboarding analytics. viewerId is a stable browser id so
   // reconnects/refreshes dedupe to one attendee. name/company are optional.
   viewerId?: string;
@@ -86,6 +86,14 @@ export interface SnapshotPayload {
     languageCode: string;
   }[];
   activePoll: PollState | null;
+}
+
+/**
+ * Snapshot as delivered to a socket. Presenter capability is connection-scoped,
+ * so it is added by the WebSocket layer rather than stored on the shared room.
+ */
+export interface ConnectionSnapshotPayload extends SnapshotPayload {
+  canPresent: boolean;
 }
 
 // --- Interactive layer (polls + reactions) ---

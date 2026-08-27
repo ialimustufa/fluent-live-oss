@@ -32,6 +32,13 @@ function categoryForPath(pathname: string): string {
   return 'other';
 }
 
+function canonicalPath(pathname: string): string {
+  // Retired marketing entry points redirect home. Canonicalize before the
+  // duplicate check so the legacy URL and its immediate redirect emit one
+  // home page-view rather than a short-lived viewer page-view followed by home.
+  return pathname === '/try' || pathname === '/beta' ? '/' : pathname;
+}
+
 function initAnalytics(): boolean {
   if (!measurementId || privacyOptedOut()) return false;
   if (initialized) return true;
@@ -57,11 +64,12 @@ function initAnalytics(): boolean {
 }
 
 export function trackRoute(pathname: string): void {
-  if (lastTrackedPath === pathname) return;
-  lastTrackedPath = pathname;
+  const canonical = canonicalPath(pathname);
+  if (lastTrackedPath === canonical) return;
+  lastTrackedPath = canonical;
   if (!initAnalytics() || !window.gtag) return;
 
-  const category = categoryForPath(pathname);
+  const category = categoryForPath(canonical);
   window.gtag('event', 'page_view', {
     page_title: document.title,
     page_location: `${window.location.origin}/${category}`,

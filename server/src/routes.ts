@@ -7,6 +7,7 @@ import { createFixedWindow } from './rateLimit.js';
 import {
   createSession,
   completePendingSlideDeletion,
+  queuePendingSlideDeletion,
   getSessionBySlug,
   getTranscripts,
   getAttendees,
@@ -31,7 +32,6 @@ const SLUG_ALPHABET_RE = /^[A-Za-z0-9_-]+$/;
 // polling, low enough to stop a scraping/DoS loop.
 const PUBLIC_GET_WINDOW_MS = 60_000;
 const ATTENDEE_ANALYTICS_LIMIT = 500;
-const SLIDE_CLEANUP_RETRY_MS = 30_000;
 
 interface TempUpload {
   tmpPath: string;
@@ -48,6 +48,7 @@ interface ParsedSessionForm {
 interface RouteDeps {
   slideStorage: SlideStorage;
   audioFanout: RealtimeAudioFanout;
+  wakeSlideCleanup: () => void;
 }
 
 function clientIp(req: FastifyRequest): string {
@@ -94,30 +95,11 @@ function parseSlideCount(value: string | undefined): number | null | 'invalid' {
 }
 
 export function registerRoutes(app: FastifyInstance, env: Env, deps: RouteDeps): void {
-  const { slideStorage, audioFanout } = deps;
+  const { slideStorage, audioFanout, wakeSlideCleanup } = deps;
   const publicGetLimiter = createFixedWindow({
     windowMs: PUBLIC_GET_WINDOW_MS,
     max: env.PUBLIC_GET_MAX,
   });
-  const slideCleanupRetries = new Map<string, NodeJS.Timeout>();
-
-  function scheduleSlideCleanupRetry(slideRef: string): void {
-    if (slideCleanupRetries.has(slideRef)) return;
-    const timer = setTimeout(async () => {
-      slideCleanupRetries.delete(slideRef);
-      try {
-        if (await slideStorage.remove(slideRef)) {
-          completePendingSlideDeletion(slideRef);
-          return;
-        }
-      } catch (err) {
-        app.log.warn({ err, slideRef }, 'unexpected slide cleanup retry failure');
-      }
-      scheduleSlideCleanupRetry(slideRef);
-    }, SLIDE_CLEANUP_RETRY_MS);
-    timer.unref();
-    slideCleanupRetries.set(slideRef, timer);
-  }
   /** Admin guard: Bearer token, timing-safe compare, rate-limited failures. */
   function requireAdmin(req: FastifyRequest, reply: FastifyReply): boolean {
     const ip = clientIp(req);
@@ -338,10 +320,18 @@ export function registerRoutes(app: FastifyInstance, env: Env, deps: RouteDeps):
     const parsed = await parseSessionForm(req, reply);
     if (!parsed) return;
     const { fields } = parsed;
+    const hasUploadedDeck = parsed.upload !== null;
     let slideRef = '';
 
     try {
       slideRef = await finalizeParsedUpload(parsed);
+      if (hasUploadedDeck) {
+        // Reserve the finalized object before the session insert. Both this
+        // queue write and createSession's attach/clear transaction are
+        // synchronous, so the in-process worker cannot observe the brief gap.
+        // A crash or failed insert therefore leaves durable cleanup work.
+        queuePendingSlideDeletion(slideRef);
+      }
       const slug = nanoid(8);
       const session = createSession({
         slug,
@@ -361,7 +351,39 @@ export function registerRoutes(app: FastifyInstance, env: Env, deps: RouteDeps):
       };
     } catch (err) {
       await cleanupParsedUpload(parsed);
-      await slideStorage.remove(slideRef);
+      if (hasUploadedDeck && slideRef) {
+        let cleanupQueued = false;
+        let queueFailed = false;
+        try {
+          // Also rechecks whether the insert actually attached the ref. Never
+          // remove an object now referenced by a committed session.
+          cleanupQueued = queuePendingSlideDeletion(slideRef);
+        } catch (queueErr) {
+          queueFailed = true;
+          app.log.warn({ err: queueErr }, 'failed to queue uploaded deck cleanup');
+        }
+        if (cleanupQueued || queueFailed) {
+          try {
+            if (await slideStorage.remove(slideRef)) {
+              if (cleanupQueued) completePendingSlideDeletion(slideRef);
+            } else if (cleanupQueued) {
+              wakeSlideCleanup();
+            } else {
+              app.log.error(
+                'uploaded deck cleanup failed after its durable queue write also failed; operator action required'
+              );
+            }
+          } catch (cleanupErr) {
+            app.log.warn(
+              { err: cleanupErr },
+              cleanupQueued
+                ? 'uploaded deck cleanup failed; retry remains queued'
+                : 'uploaded deck cleanup and durable queue write both failed; operator action required'
+            );
+            if (cleanupQueued) wakeSlideCleanup();
+          }
+        }
+      }
       throw err;
     }
   });
@@ -587,19 +609,13 @@ export function registerRoutes(app: FastifyInstance, env: Env, deps: RouteDeps):
       reply.code(404).send({ error: 'session not found' });
       return;
     }
-    // Clean up an uploaded PDF (ignore external URLs, legacy HTML, and missing files).
+    // Object deletion is durable, asynchronous maintenance. The database row
+    // is already gone, so storage degradation must not turn this into a 503.
     if (removed.cleanup_pending) {
-      if (await slideStorage.remove(removed.slide_ref)) {
-        completePendingSlideDeletion(removed.slide_ref);
-      } else {
-        scheduleSlideCleanupRetry(removed.slide_ref);
-        reply
-          .code(503)
-          .header('Retry-After', String(SLIDE_CLEANUP_RETRY_MS / 1_000))
-          .send({ error: 'session deleted, but uploaded deck cleanup is still pending' });
-        return;
-      }
+      wakeSlideCleanup();
+      reply.code(202).send({ ok: true, cleanupPending: true });
+      return;
     }
-    return { ok: true };
+    return { ok: true, cleanupPending: false };
   });
 }

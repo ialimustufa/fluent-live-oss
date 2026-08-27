@@ -96,8 +96,10 @@ slides, polls, and reactions.
 ```bash
 npm run typecheck
 npm run build
-npm run preflight
 ```
+
+On an existing deployment, `npm run preflight` inspects the live database
+without changing it and validates the upgrade against a temporary copy.
 
 For the full release check, install Playwright Chromium once and run:
 
@@ -107,8 +109,8 @@ npm run verify
 ```
 
 The full check scans the public release contents, builds both workspaces,
-validates the deployment layout, audits dependencies, and runs server and
-browser smoke tests.
+validates preflight against a disposable fixture, audits dependencies, and runs
+server and browser smoke tests.
 
 ## Deploy and operate
 

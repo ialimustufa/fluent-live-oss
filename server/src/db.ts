@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3';
 import fs from 'node:fs';
 import path from 'node:path';
+import { isGeneratedPdfUpload } from './uploads.js';
 
 export interface SessionRow {
   id: number;
@@ -50,9 +51,98 @@ export interface InitDbResult {
   pendingSlideRefs: string[];
 }
 
-const RETIRED_DATA_COMPACTION_TASK = 'retired_public_data_compaction';
+export const RETIRED_DATA_COMPACTION_TASK = 'retired_public_data_compaction';
+
+const RETIRED_DATA_TABLES = [
+  'beta_leads',
+  'trial_rate_limits',
+  'trial_abuse_events',
+] as const;
+
+const RETIRED_SCHEMA_OBJECTS = [
+  ...RETIRED_DATA_TABLES,
+  'idx_trial_rate_limits_updated',
+  'idx_trial_abuse_events_created',
+  'idx_trial_abuse_events_ip',
+  'idx_trial_abuse_events_email',
+] as const;
+
+interface LegacyTrialSchemaDetails {
+  hasIsTrial: boolean;
+  hasTrialType: boolean;
+  objectNames: Set<string>;
+  legacySessionCount: number;
+  legacyTableRowCount: number;
+}
+
+export interface LegacyTrialSchemaInspection {
+  migrationRequired: boolean;
+  legacySessionCount: number;
+  legacyTableRowCount: number;
+}
+
+function legacyTrialSchemaDetails(database: Database.Database): LegacyTrialSchemaDetails {
+  const columns = database.prepare(`PRAGMA table_info(sessions)`).all() as { name: string }[];
+  const hasIsTrial = columns.some((column) => column.name === 'is_trial');
+  const hasTrialType = columns.some((column) => column.name === 'trial_type');
+  const objectNames = new Set(
+    (database
+      .prepare(
+        `SELECT name FROM sqlite_master
+         WHERE name IN (${RETIRED_SCHEMA_OBJECTS.map(() => '?').join(', ')})`
+      )
+      .all(...RETIRED_SCHEMA_OBJECTS) as { name: string }[]).map((row) => row.name)
+  );
+
+  const predicates: string[] = [];
+  if (hasIsTrial) predicates.push('is_trial = 1');
+  if (hasTrialType) predicates.push(`trial_type IN ('try', 'beta')`);
+  const legacySessionCount = predicates.length
+    ? Number(
+        (database
+          .prepare(`SELECT COUNT(*) AS count FROM sessions WHERE ${predicates.join(' OR ')}`)
+          .get() as { count: number }).count
+      )
+    : 0;
+
+  let legacyTableRowCount = 0;
+  for (const table of RETIRED_DATA_TABLES) {
+    if (!objectNames.has(table)) continue;
+    legacyTableRowCount += Number(
+      (database.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }).count
+    );
+  }
+
+  return {
+    hasIsTrial,
+    hasTrialType,
+    objectNames,
+    legacySessionCount,
+    legacyTableRowCount,
+  };
+}
+
+/** Read-only inspection used by preflight and upgrade tooling. */
+export function inspectLegacyTrialSchema(
+  database: Database.Database
+): LegacyTrialSchemaInspection {
+  const details = legacyTrialSchemaDetails(database);
+  return {
+    migrationRequired:
+      details.hasIsTrial || details.hasTrialType || details.objectNames.size > 0,
+    legacySessionCount: details.legacySessionCount,
+    legacyTableRowCount: details.legacyTableRowCount,
+  };
+}
 
 function queueSlideDeletionIfUnreferenced(database: Database.Database, slideRef: string): boolean {
+  // External decks do not have an object managed by this application. Keep
+  // unknown r2: refs visible for operator review, but never infer a key for
+  // them or enqueue ordinary URLs as cleanup work.
+  if (!isGeneratedPdfUpload(slideRef) && !slideRef.startsWith('r2:')) {
+    database.prepare('DELETE FROM pending_slide_deletions WHERE slide_ref = ?').run(slideRef);
+    return false;
+  }
   const referenced = database
     .prepare('SELECT 1 FROM sessions WHERE slide_ref = ? LIMIT 1')
     .get(slideRef);
@@ -73,22 +163,9 @@ function queueSlideDeletionIfUnreferenced(database: Database.Database, slideRef:
  * live outside SQLite, so unreferenced objects are queued durably for cleanup.
  */
 function scrubLegacyTrialSchema(database: Database.Database): void {
-  const columns = database.prepare(`PRAGMA table_info(sessions)`).all() as { name: string }[];
-  const hasIsTrial = columns.some((column) => column.name === 'is_trial');
-  const hasTrialType = columns.some((column) => column.name === 'trial_type');
-  const legacyObjectNames = new Set(
-    (database
-      .prepare(
-        `SELECT name FROM sqlite_master
-         WHERE name IN (
-           'beta_leads', 'trial_rate_limits', 'trial_abuse_events',
-           'idx_trial_rate_limits_updated', 'idx_trial_abuse_events_created',
-           'idx_trial_abuse_events_ip', 'idx_trial_abuse_events_email'
-         )`
-      )
-      .all() as { name: string }[]).map((row) => row.name)
-  );
-  if (!hasIsTrial && !hasTrialType && legacyObjectNames.size === 0) return;
+  const details = legacyTrialSchemaDetails(database);
+  const { hasIsTrial, hasTrialType } = details;
+  if (!hasIsTrial && !hasTrialType && details.objectNames.size === 0) return;
 
   const predicates: string[] = [];
   if (hasIsTrial) predicates.push('is_trial = 1');
@@ -129,25 +206,14 @@ function scrubLegacyTrialSchema(database: Database.Database): void {
     `);
     if (hasIsTrial) database.exec(`ALTER TABLE sessions DROP COLUMN is_trial`);
     if (hasTrialType) database.exec(`ALTER TABLE sessions DROP COLUMN trial_type`);
-    database
-      .prepare(`INSERT OR IGNORE INTO database_maintenance_tasks (task) VALUES (?)`)
-      .run(RETIRED_DATA_COMPACTION_TASK);
+    // Empty retired columns/tables do not leave sensitive content in free
+    // pages, so they do not warrant a potentially expensive VACUUM.
+    if (details.legacySessionCount > 0 || details.legacyTableRowCount > 0) {
+      database
+        .prepare(`INSERT OR IGNORE INTO database_maintenance_tasks (task) VALUES (?)`)
+        .run(RETIRED_DATA_COMPACTION_TASK);
+    }
   })();
-}
-
-function finishPendingDataCompaction(database: Database.Database): void {
-  const pending = database
-    .prepare('SELECT 1 FROM database_maintenance_tasks WHERE task = ?')
-    .get(RETIRED_DATA_COMPACTION_TASK);
-  if (!pending) return;
-
-  database.pragma('secure_delete = ON');
-  database.pragma('wal_checkpoint(TRUNCATE)');
-  database.exec('VACUUM');
-  database
-    .prepare('DELETE FROM database_maintenance_tasks WHERE task = ?')
-    .run(RETIRED_DATA_COMPACTION_TASK);
-  database.pragma('wal_checkpoint(TRUNCATE)');
 }
 
 export function initDb(databasePath: string): InitDbResult {
@@ -257,11 +323,7 @@ export function initDb(databasePath: string): InitDbResult {
     db.exec(`ALTER TABLE polls ADD COLUMN correct TEXT NOT NULL DEFAULT '[]'`);
   }
   scrubLegacyTrialSchema(db);
-  finishPendingDataCompaction(db);
-  const pendingSlideRefs = db
-    .prepare('SELECT slide_ref FROM pending_slide_deletions ORDER BY created_at, slide_ref')
-    .all()
-    .map((row) => (row as { slide_ref: string }).slide_ref);
+  const pendingSlideRefs = listPendingSlideDeletions(db);
   return { database: db, pendingSlideRefs };
 }
 
@@ -272,6 +334,66 @@ export function getDb(): Database.Database {
 
 export function completePendingSlideDeletion(slideRef: string): void {
   getDb().prepare('DELETE FROM pending_slide_deletions WHERE slide_ref = ?').run(slideRef);
+}
+
+export function listPendingSlideDeletions(
+  database: Database.Database = getDb()
+): string[] {
+  return database
+    .prepare('SELECT slide_ref FROM pending_slide_deletions ORDER BY created_at, slide_ref')
+    .all()
+    .map((row) => (row as { slide_ref: string }).slide_ref);
+}
+
+/**
+ * Recheck a queued ref immediately before external deletion. If a session has
+ * since attached the ref, the stale queue entry is removed instead.
+ */
+export function preparePendingSlideDeletion(slideRef: string): boolean {
+  const database = getDb();
+  return database.transaction(() => {
+    const pending = database
+      .prepare('SELECT 1 FROM pending_slide_deletions WHERE slide_ref = ?')
+      .get(slideRef);
+    if (!pending) return false;
+    return queueSlideDeletionIfUnreferenced(database, slideRef);
+  })();
+}
+
+/** Durably queue an uploaded object before attempting best-effort deletion. */
+export function queuePendingSlideDeletion(slideRef: string): boolean {
+  return queueSlideDeletionIfUnreferenced(getDb(), slideRef);
+}
+
+export interface DatabaseMaintenanceStatus {
+  pendingSlideDeletionCount: number;
+  compactionPending: boolean;
+}
+
+/** Read-only maintenance status for health/preflight reporting. */
+export function inspectDatabaseMaintenance(
+  database: Database.Database = getDb()
+): DatabaseMaintenanceStatus {
+  const pendingSlideDeletionCount = Number(
+    (database.prepare('SELECT COUNT(*) AS count FROM pending_slide_deletions').get() as {
+      count: number;
+    }).count
+  );
+  const compactionPending = Boolean(
+    database
+      .prepare('SELECT 1 FROM database_maintenance_tasks WHERE task = ?')
+      .get(RETIRED_DATA_COMPACTION_TASK)
+  );
+  return { pendingSlideDeletionCount, compactionPending };
+}
+
+/** Clear the durable marker only after offline compaction succeeds. */
+export function completeRetiredDataCompaction(
+  database: Database.Database = getDb()
+): void {
+  database
+    .prepare('DELETE FROM database_maintenance_tasks WHERE task = ?')
+    .run(RETIRED_DATA_COMPACTION_TASK);
 }
 
 // --- Session queries ---
@@ -286,16 +408,22 @@ export function createSession(row: {
   echo_target_language: boolean;
   presentation_mode?: 'in_person' | 'remote';
 }): SessionRow {
-  getDb()
-    .prepare(
-      `INSERT INTO sessions (slug, title, target_lang, slide_type, slide_ref, slide_count, echo_target_language, presentation_mode)
-       VALUES (@slug, @title, @target_lang, @slide_type, @slide_ref, @slide_count, @echo, @presentation_mode)`
-    )
-    .run({
-      ...row,
-      echo: row.echo_target_language ? 1 : 0,
-      presentation_mode: row.presentation_mode ?? 'in_person',
-    });
+  const database = getDb();
+  database.transaction(() => {
+    database
+      .prepare(
+        `INSERT INTO sessions (slug, title, target_lang, slide_type, slide_ref, slide_count, echo_target_language, presentation_mode)
+         VALUES (@slug, @title, @target_lang, @slide_type, @slide_ref, @slide_count, @echo, @presentation_mode)`
+      )
+      .run({
+        ...row,
+        echo: row.echo_target_language ? 1 : 0,
+        presentation_mode: row.presentation_mode ?? 'in_person',
+      });
+    // A successful attachment supersedes any stale failed-cleanup entry for
+    // the same ref, and both changes commit atomically.
+    database.prepare('DELETE FROM pending_slide_deletions WHERE slide_ref = ?').run(row.slide_ref);
+  })();
   return getSessionBySlug(row.slug)!;
 }
 
@@ -445,7 +573,10 @@ export function deleteSession(slug: string): {
     db.prepare('DELETE FROM polls WHERE session_id = ?').run(s.id);
     db.prepare('DELETE FROM reaction_tallies WHERE session_id = ?').run(s.id);
     db.prepare('DELETE FROM sessions WHERE id = ?').run(s.id);
-    cleanupPending = queueSlideDeletionIfUnreferenced(db, s.slide_ref);
+    // Only PDF sessions own a managed local/R2 object. Google Slides and HTML
+    // sessions reference external URLs and need no storage maintenance.
+    cleanupPending =
+      s.slide_type === 'pdf' && queueSlideDeletionIfUnreferenced(db, s.slide_ref);
   })();
   return { slide_ref: s.slide_ref, slide_type: s.slide_type, cleanup_pending: cleanupPending };
 }

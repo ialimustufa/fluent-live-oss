@@ -214,7 +214,6 @@ export function loadEnv(): Env {
     ...new Set(
       [
         r2PublicBaseUrl,
-        assetCdnBaseUrl,
         ...cleanOptionalUrlList(process.env.R2_CACHE_PURGE_BASE_URLS, 'R2_CACHE_PURGE_BASE_URLS'),
       ].filter((value): value is string => Boolean(value))
     ),
@@ -229,7 +228,7 @@ export function loadEnv(): Env {
   }
   if (r2CachePurgeBaseUrls.length > 0 && (!r2CachePurgeZoneId || !r2CachePurgeApiToken)) {
     throw new Error(
-      'R2_CACHE_PURGE_ZONE_ID and R2_CACHE_PURGE_API_TOKEN are required when an R2/CDN public base URL is set.'
+      'R2_CACHE_PURGE_ZONE_ID and R2_CACHE_PURGE_API_TOKEN are required when an R2 slide purge base URL is set.'
     );
   }
 

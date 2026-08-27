@@ -46,9 +46,10 @@ function Home() {
             to="/new"
             className="btn-primary flex items-center gap-2 rounded-[var(--r-lg)] px-8 py-3 text-base"
           >
-            Create a session
+            Presenter access
           </Link>
         </div>
+        <p className="mt-3 text-sm text-[var(--faint)]">Presenter key required.</p>
       </div>
     </div>
   );
@@ -60,6 +61,8 @@ export default function App() {
       <AnalyticsRouteTracker />
       <Routes>
         <Route path="/" element={<Home />} />
+        <Route path="/try" element={<Navigate replace to="/" />} />
+        <Route path="/beta" element={<Navigate replace to="/" />} />
         <Route path="/new" element={<NewSession />} />
         <Route path="/admin" element={<AdminDashboard />} />
         <Route path="/:slug" element={<Viewer />} />

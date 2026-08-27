@@ -28,7 +28,8 @@ export interface SlideStorage {
 function r2ObjectKey(ref: string): string | null {
   if (!ref.startsWith(R2_REF_PREFIX)) return null;
   const key = ref.slice(R2_REF_PREFIX.length);
-  return key && !key.includes('..') ? key : null;
+  const file = key.startsWith('slides/') ? key.slice('slides/'.length) : '';
+  return file && isGeneratedPdfUpload(file) ? key : null;
 }
 
 function r2RefFile(ref: string): string | null {
@@ -61,8 +62,14 @@ export function createSlideStorage(env: Env): SlideStorage {
     async function removeMany(refs: string[]): Promise<Set<string>> {
       const completed = new Set<string>();
       for (const ref of refs) {
-        if (r2ObjectKey(ref)) {
-          console.warn(`[storage] cannot remove R2 object while R2 storage is not configured: ${ref}`);
+        if (ref.startsWith(R2_REF_PREFIX)) {
+          const reason = r2ObjectKey(ref)
+            ? 'R2 storage is not configured'
+            : 'the ref is outside the managed slides namespace';
+          console.warn(`[storage] cannot remove queued R2 object: ${reason}`);
+        } else if (!isGeneratedPdfUpload(ref)) {
+          // External/legacy URLs have no managed object to remove.
+          completed.add(ref);
         } else if (await removeUploadedPdf(env.UPLOADS_DIR, ref)) {
           completed.add(ref);
         }
@@ -176,11 +183,18 @@ export function createSlideStorage(env: Env): SlideStorage {
     const completed = new Set<string>();
     const r2RefsByKey = new Map<string, string[]>();
     for (const ref of refs) {
-      const key = r2ObjectKey(ref);
-      if (key) {
+      if (ref.startsWith(R2_REF_PREFIX)) {
+        const key = r2ObjectKey(ref);
+        if (!key) {
+          console.warn('[storage] refusing to remove queued R2 ref outside the managed slides namespace');
+          continue;
+        }
         const matchingRefs = r2RefsByKey.get(key) ?? [];
         matchingRefs.push(ref);
         r2RefsByKey.set(key, matchingRefs);
+      } else if (!isGeneratedPdfUpload(ref)) {
+        // External/legacy URLs have no managed object to remove.
+        completed.add(ref);
       } else if (await removeUploadedPdf(env.UPLOADS_DIR, ref)) {
         completed.add(ref);
       }

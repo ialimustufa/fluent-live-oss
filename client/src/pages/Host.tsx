@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { useParams } from 'react-router-dom';
+import { Link, useParams } from 'react-router-dom';
 import {
   Play, Pause, Square, RotateCw, ChevronLeft, ChevronRight, Users, Circle,
   MonitorPlay, PictureInPicture2, X, Check, Plus, Volume2, Headphones, Smartphone,
@@ -80,6 +80,7 @@ function HostInner() {
   const { slug = '' } = useParams();
   const auth = getAdminKey() ?? '';
   const [session, setSession] = useState<SessionInfo | null>(null);
+  const [sessionNotFound, setSessionNotFound] = useState(false);
   const [state, setState] = useState<string>('created');
   const [slideIndex, setSlideIndex] = useState(0);
   const [slideCount, setSlideCount] = useState<number | null>(null);
@@ -115,7 +116,7 @@ function HostInner() {
   const [confirmDeletePoll, setConfirmDeletePoll] = useState(false);
   const [routing, setRouting] = useState<Routing>('viewers');
   const [advancedAudioOpen, setAdvancedAudioOpen] = useState(false);
-  const hasSession = !!session;
+  const hasSession = session?.slug === slug;
 
   const sockRef = useRef<SessionSocket | null>(null);
   const micRef = useRef<MicCapture | null>(null);
@@ -167,15 +168,40 @@ function HostInner() {
   }, []);
 
   useEffect(() => {
-    void fetchSession(slug).then((s) => {
-      setSession(s);
-      setState(s.state);
-      setSlideIndex(s.slideIndex);
-    });
-    void refreshAudioDevices(true).then(({ inputs }) => {
-      if (!micIdRef.current && inputs[0]) selectMicId(inputs[0].deviceId);
-    });
-  }, [refreshAudioDevices, selectMicId, slug]);
+    let active = true;
+    setSession(null);
+    setSessionNotFound(false);
+    void fetchSession(slug)
+      .then((s) => {
+        if (!active) return;
+        setSession(s);
+        setState(s.state);
+        setSlideIndex(s.slideIndex);
+      })
+      .catch(() => {
+        if (active) setSessionNotFound(true);
+      });
+    return () => {
+      active = false;
+    };
+  }, [slug]);
+
+  // Enumerating devices can expose permission UI in some browsers. Do not do
+  // any device work until the requested session has been confirmed to exist.
+  useEffect(() => {
+    if (!hasSession) return;
+    let active = true;
+    void refreshAudioDevices(false)
+      .then(({ inputs }) => {
+        if (active && !micIdRef.current && inputs[0]) selectMicId(inputs[0].deviceId);
+      })
+      .catch(() => {
+        /* MicCapture surfaces an actionable error if acquisition also fails. */
+      });
+    return () => {
+      active = false;
+    };
+  }, [hasSession, refreshAudioDevices, selectMicId]);
 
   // Host WS — authenticates with the admin key in the hello message.
   useEffect(() => {
@@ -295,13 +321,13 @@ function HostInner() {
   }, [refreshAudioDevices, selectMicId]);
 
   useEffect(() => {
+    if (!hasSession) return;
     void ensureMic();
     return () => {
       micRef.current?.stop();
       micRef.current = null;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [ensureMic, hasSession]);
 
   const recoverMic = useCallback(async (reason: string) => {
     const wasStreaming = micRef.current?.streaming ?? stateRef.current === 'live';
@@ -352,6 +378,7 @@ function HostInner() {
   // Refresh and recover when hardware changes. If the selected mic disappeared,
   // automatically fall back to the first available input and keep streaming.
   useEffect(() => {
+    if (!hasSession) return;
     const md = navigator.mediaDevices;
     if (!md?.addEventListener) return;
     const refresh = () => {
@@ -359,7 +386,7 @@ function HostInner() {
     };
     md.addEventListener('devicechange', refresh);
     return () => md.removeEventListener('devicechange', refresh);
-  }, [recoverMic]);
+  }, [hasSession, recoverMic]);
 
   useEffect(() => {
     micRef.current?.setMuted(micMuted);
@@ -569,7 +596,7 @@ function HostInner() {
   // Attendance analytics is intentionally low-frequency; live viewer count is
   // already provided over the host websocket.
   const refreshAnalytics = useCallback(async () => {
-    if (analyticsRefreshInFlightRef.current) return;
+    if (!hasSession || analyticsRefreshInFlightRef.current) return;
     analyticsRefreshInFlightRef.current = true;
     setAnalyticsRefreshing(true);
     try {
@@ -581,20 +608,40 @@ function HostInner() {
       analyticsRefreshInFlightRef.current = false;
       setAnalyticsRefreshing(false);
     }
-  }, [slug, auth]);
+  }, [slug, auth, hasSession]);
 
   useEffect(() => {
+    if (!hasSession) return;
     void refreshAnalytics();
     const id = window.setInterval(() => void refreshAnalytics(), ANALYTICS_REFRESH_MS);
     return () => clearInterval(id);
-  }, [refreshAnalytics]);
+  }, [hasSession, refreshAnalytics]);
 
   // We route monitor/PA audio through a media element, so element setSinkId
   // counts too (broader support than AudioContext.setSinkId).
   const supportsSinkId =
     'setSinkId' in HTMLMediaElement.prototype || 'setSinkId' in AudioContext.prototype;
 
-  if (!session) {
+  if (sessionNotFound) {
+    return (
+      <div className="bg-aurora flex min-h-screen items-center justify-center p-6 text-center">
+        <div className="glass-panel grad-border w-full max-w-md rounded-3xl p-8 shadow-2xl">
+          <h1 className="text-2xl font-semibold text-[var(--fg)]">Session not found</h1>
+          <p className="mt-3 text-[var(--muted)]">
+            This session was deleted or this link is no longer valid.
+          </p>
+          <Link
+            to="/admin"
+            className="btn-primary mt-6 inline-flex rounded-[var(--r-md)] px-5 py-2.5"
+          >
+            Back to presenter dashboard
+          </Link>
+        </div>
+      </div>
+    );
+  }
+
+  if (!session || !hasSession) {
     return (
       <div className="bg-aurora flex min-h-screen items-center justify-center text-[var(--faint)]">
         Loading…
@@ -921,9 +968,9 @@ function HostInner() {
               target="_blank"
               rel="noreferrer"
               className="btn-ghost flex flex-1 items-center justify-center gap-1.5 rounded-[var(--r-md)] px-3 py-2 text-center text-xs"
-              title="Open the projector/stage view (slides + captions + QR) in a new tab"
+              title="Open the display-only projector view; control slides from this host console"
             >
-              <MonitorPlay size={15} /> Project (stage view)
+              <MonitorPlay size={15} /> Project (display-only)
             </a>
             {pip.supported && (
               <button

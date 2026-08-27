@@ -1,5 +1,6 @@
 import { useState, type ReactNode } from 'react';
 import { Lock } from 'lucide-react';
+import { Link } from 'react-router-dom';
 import { getAdminKey, setAdminKey, verifyAdminKey } from '../lib/adminKey';
 
 /**
@@ -49,7 +50,7 @@ export default function AdminKeyGate({ children }: { children: ReactNode }) {
             <Lock size={21} />
           </div>
           <div>
-            <h1 className="text-lg font-semibold text-[var(--fg)]">Admin access</h1>
+            <h1 className="text-lg font-semibold text-[var(--fg)]">Presenter access</h1>
             <p className="text-xs text-[var(--faint)]">Enter your presenter key to continue</p>
           </div>
         </div>
@@ -58,7 +59,7 @@ export default function AdminKeyGate({ children }: { children: ReactNode }) {
           autoFocus
           value={key}
           onChange={(e) => setKey(e.target.value)}
-          placeholder="Admin key"
+          placeholder="Presenter key"
           className="input-field mb-3 w-full px-4 py-2.5 text-[var(--fg)] placeholder:text-[var(--faint)]"
         />
         {error && <p className="mb-3 text-sm text-error">{error}</p>}
@@ -69,6 +70,12 @@ export default function AdminKeyGate({ children }: { children: ReactNode }) {
         >
           {checking ? 'Checking…' : 'Continue'}
         </button>
+        <Link
+          to="/"
+          className="mt-4 block text-center text-sm text-[var(--muted)] transition hover:text-[var(--fg)]"
+        >
+          Back to Fluent
+        </Link>
       </form>
     </div>
   );

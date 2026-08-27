@@ -6,13 +6,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadEnv } from './env.js';
-import { completePendingSlideDeletion, initDb } from './db.js';
+import { initDb } from './db.js';
 import { registerRoutes } from './routes.js';
 import { attachWebSocketServer } from './ws.js';
 import { closeAllRooms, configureRooms } from './rooms.js';
 import { isGeneratedPdfUpload } from './uploads.js';
 import { createSlideStorage } from './storage.js';
 import { RealtimeAudioFanout } from './realtime-audio.js';
+import { SlideCleanupWorker } from './slide-cleanup-worker.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -31,22 +32,13 @@ function unique<T>(values: (T | null | undefined)[]): T[] {
 
 async function main(): Promise<void> {
   const env = loadEnv();
-  const { pendingSlideRefs } = initDb(env.DATABASE_PATH);
+  const { database } = initDb(env.DATABASE_PATH);
   const slideStorage = createSlideStorage(env);
   const audioFanout = new RealtimeAudioFanout(env);
   configureRooms(env.GEMINI_API_KEY, env.MAX_VIEWERS_PER_SESSION, audioFanout, {
     audioSyncMetadata: env.AUDIO_SYNC_METADATA,
   });
   fs.mkdirSync(env.UPLOADS_DIR, { recursive: true });
-
-  const completedSlideDeletions = await slideStorage.removeMany(pendingSlideRefs);
-  for (const slideRef of completedSlideDeletions) completePendingSlideDeletion(slideRef);
-  const failedSlideDeletions = pendingSlideRefs.length - completedSlideDeletions.size;
-  if (failedSlideDeletions > 0) {
-    throw new Error(
-      `Failed to remove ${failedSlideDeletions} pending slide object(s); cleanup remains queued for the next start.`
-    );
-  }
 
   const app = Fastify({
     logger: {
@@ -69,6 +61,13 @@ async function main(): Promise<void> {
       },
     },
     trustProxy: env.TRUST_PROXY,
+  });
+  const slideCleanupWorker = new SlideCleanupWorker(slideStorage, app.log);
+  app.addHook('onClose', async () => {
+    await slideCleanupWorker.stop();
+    // Close SQLite after all queued worker activity has stopped so WAL data is
+    // checkpointed before an operator takes an off-service database backup.
+    if (database.open) database.close();
   });
 
   const r2Origin = originOf(env.R2_PUBLIC_BASE_URL);
@@ -132,7 +131,11 @@ async function main(): Promise<void> {
       .send(pdf.body);
   });
 
-  registerRoutes(app, env, { slideStorage, audioFanout });
+  registerRoutes(app, env, {
+    slideStorage,
+    audioFanout,
+    wakeSlideCleanup: () => slideCleanupWorker.wake(),
+  });
 
   // Built client (client/dist) — present in production, absent in dev
   // (the Vite dev server proxies /api, /ws and /uploads to us instead).
@@ -217,6 +220,7 @@ async function main(): Promise<void> {
   }
 
   await app.listen({ port: env.PORT, host: env.HOST });
+  slideCleanupWorker.start();
   app.log.info(`Fluent listening on ${env.HOST}:${env.PORT}`);
 }
 

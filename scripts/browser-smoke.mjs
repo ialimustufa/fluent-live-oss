@@ -13,12 +13,34 @@ const SECRET = 'browser-smoke-secret-long-enough';
 
 const env = {
   ...process.env,
+  NODE_ENV: 'test',
+  HOST: '127.0.0.1',
   PORT: String(PORT),
   ADMIN_SECRET: SECRET,
   GEMINI_API_KEY: 'fake-key-for-browser-smoke',
   DATABASE_PATH: path.join(DATA, 'app.db'),
   UPLOADS_DIR: path.join(DATA, 'uploads'),
   PUBLIC_ORIGIN: BASE,
+  TRUST_PROXY: 'false',
+  SENTRY_DSN: '',
+  ENABLE_TEST_HOOKS: 'false',
+  AUDIO_SYNC_METADATA: 'false',
+  AUDIO_SUBSCRIPTION_ACTIVE: 'false',
+  CF_REALTIME_APP_ID: '',
+  CF_REALTIME_APP_SECRET: '',
+  CF_REALTIME_APP_TOKEN: '',
+  CF_REALTIME_API_BASE: '',
+  R2_ACCOUNT_ID: '',
+  R2_ACCESS_KEY_ID: '',
+  R2_SECRET_ACCESS_KEY: '',
+  R2_BUCKET: '',
+  R2_PUBLIC_BASE_URL: '',
+  R2_CACHE_PURGE_BASE_URLS: '',
+  R2_CACHE_PURGE_ZONE_ID: '',
+  R2_CACHE_PURGE_API_TOKEN: '',
+  ASSET_CDN_BASE_URL: '',
+  MAX_VIEWERS_PER_SESSION: '500',
+  PUBLIC_GET_MAX: '2000',
 };
 
 let passed = 0;
@@ -36,10 +58,12 @@ function check(name, ok, extra = '') {
 function makePdf() {
   const objects = [
     '<< /Type /Catalog /Pages 2 0 R >>',
-    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>',
     '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>',
     '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
     '<< /Length 48 >>\nstream\nBT /F1 24 Tf 72 720 Td (Browser Smoke) Tj ET\nendstream',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 7 0 R >>',
+    '<< /Length 52 >>\nstream\nBT /F1 24 Tf 72 720 Td (Browser Smoke Page 2) Tj ET\nendstream',
   ];
   let pdf = '%PDF-1.4\n';
   const offsets = [0];
@@ -204,6 +228,39 @@ async function checkNoResourceUi(page, label) {
   );
 }
 
+function analyticsProbeBundle() {
+  const clientDist = path.join(ROOT, 'client', 'dist');
+  const indexHtml = fs.readFileSync(path.join(clientDist, 'index.html'), 'utf8');
+  const scriptMatch = indexHtml.match(/<script[^>]+src="([^"]*\/assets\/index-[^"]+\.js)"/);
+  if (!scriptMatch) throw new Error('could not locate the built client entry script for analytics probing');
+
+  const scriptUrl = new URL(scriptMatch[1], BASE);
+  if (scriptUrl.origin !== BASE) {
+    throw new Error(`analytics probe requires a same-origin client build, got ${scriptUrl.origin}`);
+  }
+  const scriptFile = path.join(clientDist, scriptUrl.pathname.replace(/^\/+/, ''));
+  const source = fs.readFileSync(scriptFile, 'utf8');
+  const analyticsMarker = source.indexOf('fluent_page_category');
+  if (analyticsMarker < 0) throw new Error('built client is missing the analytics route tracker');
+
+  // Verification builds intentionally disable GA. For this one browser probe,
+  // bypass only the compiled analytics-initializer guard and supply a local
+  // gtag spy via addInitScript below. Canonicalization and duplicate suppression
+  // still run from the real production bundle, and no Google script is loaded.
+  const probeStart = Math.max(0, analyticsMarker - 1_000);
+  const probeEnd = Math.min(source.length, analyticsMarker + 200);
+  const probeSlice = source.slice(probeStart, probeEnd);
+  const initializerGuard = /![A-Za-z_$][\w$]*\(\)\|\|!window\.gtag/;
+  if (!initializerGuard.test(probeSlice)) {
+    throw new Error('could not isolate the built analytics initializer guard');
+  }
+  const patchedSlice = probeSlice.replace(initializerGuard, '!window.gtag');
+  return {
+    pathname: scriptUrl.pathname,
+    source: source.slice(0, probeStart) + patchedSlice + source.slice(probeEnd),
+  };
+}
+
 fs.rmSync(DATA, { recursive: true, force: true });
 
 if (!fs.existsSync(path.join(ROOT, 'client', 'dist', 'index.html'))) {
@@ -233,25 +290,63 @@ try {
   const viewerPdfRequests = [];
   const analyticsRequests = [];
   const hostAnalyticsRequests = [];
+  const sessionInfoRequests = [];
   let phase = 'root';
+  let tolerateConnectionRefused = false;
 
-  page.on('console', (msg) => {
-    if (msg.type() === 'error') consoleErrors.push(msg.text());
-  });
-  page.on('response', (res) => {
-    if (res.status() === 404) missingResponses.push(res.url());
-  });
-  page.on('request', (req) => {
-    if (/googletagmanager\.com|google-analytics\.com/.test(req.url())) {
-      analyticsRequests.push(req.url());
+  const attachDiagnostics = (target, label) => {
+    target.on('console', (msg) => {
+      if (msg.type() !== 'error') return;
+      const message = msg.text();
+      if (
+        message.includes('404 (Not Found)') &&
+        new URL(target.url()).pathname === '/missing-host/host'
+      ) return;
+      if (tolerateConnectionRefused && message.includes('ERR_CONNECTION_REFUSED')) return;
+      consoleErrors.push(`[${label}] ${message}`);
+    });
+    target.on('response', (res) => {
+      if (res.status() !== 404) return;
+      const url = new URL(res.url());
+      if (url.origin === BASE && url.pathname === '/api/sessions/missing-host') return;
+      missingResponses.push(`[${label}] ${res.url()}`);
+    });
+    target.on('request', (req) => {
+      if (/googletagmanager\.com|google-analytics\.com/.test(req.url())) {
+        analyticsRequests.push(req.url());
+      }
+      const url = new URL(req.url());
+      if (url.origin === BASE && /^\/api\/sessions\/[^/]+$/.test(url.pathname)) {
+        sessionInfoRequests.push(url.pathname);
+      }
+      if (url.origin === BASE && /\/api\/sessions\/[^/]+\/analytics$/.test(url.pathname)) {
+        hostAnalyticsRequests.push(req.url());
+      }
+      if (/PdfViewer|pdf\.worker|pdfjs/.test(req.url())) {
+        if (phase === 'root') rootPdfRequests.push(req.url());
+        else viewerPdfRequests.push(req.url());
+      }
+    });
+  };
+  attachDiagnostics(page, 'main');
+  await page.addInitScript(() => {
+    const counts = { enumerateDevices: 0, getUserMedia: 0 };
+    Object.defineProperty(window, '__fluentMediaCalls', { value: counts, configurable: true });
+    const media = navigator.mediaDevices;
+    if (!media) return;
+    if (typeof media.enumerateDevices === 'function') {
+      const original = media.enumerateDevices.bind(media);
+      media.enumerateDevices = async (...args) => {
+        counts.enumerateDevices += 1;
+        return original(...args);
+      };
     }
-    const url = new URL(req.url());
-    if (url.origin === BASE && /\/api\/sessions\/[^/]+\/analytics$/.test(url.pathname)) {
-      hostAnalyticsRequests.push(req.url());
-    }
-    if (/PdfViewer|pdf\.worker|pdfjs/.test(req.url())) {
-      if (phase === 'root') rootPdfRequests.push(req.url());
-      else viewerPdfRequests.push(req.url());
+    if (typeof media.getUserMedia === 'function') {
+      const original = media.getUserMedia.bind(media);
+      media.getUserMedia = async (...args) => {
+        counts.getUserMedia += 1;
+        return original(...args);
+      };
     }
   });
   await page.route('https://www.googletagmanager.com/**', (route) =>
@@ -268,7 +363,115 @@ try {
   await page.getByRole('heading', { name: 'Fluent' }).waitFor();
   check('home page loads with CSP', root?.ok() && rootCsp.includes("default-src 'self'"));
   check('home page does not load PDF chunk', rootPdfRequests.length === 0, rootPdfRequests.join('\n'));
+  const presenterAccess = page.getByRole('link', { name: 'Presenter access', exact: true });
+  check(
+    'home page presents a keyed presenter entry point',
+    (await presenterAccess.getAttribute('href')) === '/new' &&
+      (await page.getByText('Presenter key required.', { exact: true }).isVisible())
+  );
   await checkNoPersonalSignupUi(page, 'home page');
+
+  await presenterAccess.click();
+  await page.getByRole('heading', { name: 'Presenter access', exact: true }).waitFor();
+  const backToFluent = page.getByRole('link', { name: 'Back to Fluent', exact: true });
+  check(
+    'presenter gate has a clear home escape',
+    (await backToFluent.getAttribute('href')) === '/'
+  );
+  await backToFluent.click();
+  await page.waitForURL(`${BASE}/`);
+
+  const analyticsProbe = analyticsProbeBundle();
+  const retiredAnalyticsPage = await browser.newPage();
+  const retiredAnalyticsRequests = [];
+  attachDiagnostics(retiredAnalyticsPage, 'retired-analytics');
+  retiredAnalyticsPage.on('request', (request) => {
+    if (/googletagmanager\.com|google-analytics\.com/.test(request.url())) {
+      retiredAnalyticsRequests.push(request.url());
+    }
+  });
+  await retiredAnalyticsPage.addInitScript(() => {
+    window.dataLayer = [];
+    window.gtag = (...args) => window.dataLayer.push(args);
+  });
+  await retiredAnalyticsPage.route(`${BASE}${analyticsProbe.pathname}`, (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: 'application/javascript; charset=utf-8',
+      body: analyticsProbe.source,
+    })
+  );
+  await retiredAnalyticsPage.route('https://www.googletagmanager.com/**', (route) =>
+    route.fulfill({ status: 200, contentType: 'application/javascript', body: '' })
+  );
+  await retiredAnalyticsPage.route('https://www.google-analytics.com/**', (route) =>
+    route.fulfill({ status: 204, body: '' })
+  );
+  await retiredAnalyticsPage.route('https://region1.google-analytics.com/**', (route) =>
+    route.fulfill({ status: 204, body: '' })
+  );
+  await retiredAnalyticsPage.route('https://fonts.googleapis.com/**', (route) =>
+    route.fulfill({ status: 200, contentType: 'text/css', body: '' })
+  );
+
+  for (const retiredPath of ['/try', '/beta']) {
+    await retiredAnalyticsPage.goto(`${BASE}${retiredPath}`, { waitUntil: 'domcontentloaded' });
+    await retiredAnalyticsPage.waitForURL(`${BASE}/`);
+    await retiredAnalyticsPage.waitForFunction(() =>
+      window.dataLayer?.some(
+        (entry) => Array.isArray(entry) && entry[0] === 'event' && entry[1] === 'page_view'
+      )
+    );
+    const pageViews = await retiredAnalyticsPage.evaluate(() =>
+      (window.dataLayer ?? [])
+        .filter(
+          (entry) => Array.isArray(entry) && entry[0] === 'event' && entry[1] === 'page_view'
+        )
+        .map((entry) => entry[2])
+    );
+    check(`${retiredPath} deliberately redirects home`, new URL(retiredAnalyticsPage.url()).pathname === '/');
+    check(
+      `${retiredPath} emits exactly one canonical home page_view`,
+      pageViews.length === 1 &&
+        pageViews[0]?.fluent_page_category === 'home' &&
+        pageViews[0]?.page_path === '/home',
+      JSON.stringify(pageViews)
+    );
+  }
+  await retiredAnalyticsPage.close();
+  check(
+    'retired page redirects never request viewer session data',
+    !sessionInfoRequests.includes('/api/sessions/try') &&
+      !sessionInfoRequests.includes('/api/sessions/beta'),
+    sessionInfoRequests.join('\n')
+  );
+  check(
+    'retired route analytics stays hermetic',
+    retiredAnalyticsRequests.length === 0,
+    retiredAnalyticsRequests.join('\n')
+  );
+
+  await page.evaluate((secret) => {
+    sessionStorage.setItem(
+      'fluent.adminKey',
+      JSON.stringify({ key: secret, expiresAt: Date.now() + 24 * 60 * 60 * 1000 })
+    );
+  }, SECRET);
+  hostAnalyticsRequests.length = 0;
+  await page.goto(`${BASE}/missing-host/host`, { waitUntil: 'domcontentloaded' });
+  await page.getByRole('heading', { name: 'Session not found', exact: true }).waitFor();
+  const hostRecovery = page.getByRole('link', { name: 'Back to presenter dashboard', exact: true });
+  const mediaCalls = await page.evaluate(() => window.__fluentMediaCalls);
+  check(
+    'missing Host renders recovery instead of hanging',
+    (await hostRecovery.getAttribute('href')) === '/admin' &&
+      (await page.getByText('This session was deleted or this link is no longer valid.', { exact: true }).isVisible())
+  );
+  check(
+    'missing Host performs no device, microphone, or analytics work',
+    mediaCalls.enumerateDevices === 0 && mediaCalls.getUserMedia === 0 && hostAnalyticsRequests.length === 0,
+    JSON.stringify({ mediaCalls, hostAnalyticsRequests })
+  );
 
   phase = 'viewer';
   await page.goto(`${BASE}/${created.slug}/resource`, { waitUntil: 'networkidle' });
@@ -288,9 +491,74 @@ try {
   await checkNoResourceUi(page, 'viewer');
 
   const stagePage = await browser.newPage();
+  attachDiagnostics(stagePage, 'display-stage');
   await stagePage.goto(`${BASE}/${created.slug}/present`, { waitUntil: 'domcontentloaded' });
   await stagePage.locator('canvas').waitFor({ timeout: 15000 });
+  await stagePage.getByText('Display-only stage', { exact: true }).waitFor({ timeout: 5000 });
+  check(
+    'unauthenticated stage is display-only',
+    (await stagePage.getByRole('button', { name: 'Previous slide' }).count()) === 0 &&
+      (await stagePage.getByRole('button', { name: 'Next slide' }).count()) === 0
+  );
   await checkNoResourceUi(stagePage, 'projector');
+
+  const rejectedStage = await browser.newPage();
+  attachDiagnostics(rejectedStage, 'rejected-stage');
+  await rejectedStage.goto(BASE, { waitUntil: 'domcontentloaded' });
+  await rejectedStage.evaluate(() => {
+    sessionStorage.setItem(
+      'fluent.adminKey',
+      JSON.stringify({ key: 'wrong-presenter-key', expiresAt: Date.now() + 24 * 60 * 60 * 1000 })
+    );
+  });
+  await rejectedStage.goto(`${BASE}/${created.slug}/present`, { waitUntil: 'domcontentloaded' });
+  await rejectedStage.getByText('Presenter key rejected; stage is read-only.', { exact: true }).waitFor();
+  check(
+    'invalid presenter key never exposes controls',
+    (await rejectedStage.getByRole('button', { name: 'Next slide' }).count()) === 0
+  );
+
+  const presenterStage = await browser.newPage();
+  attachDiagnostics(presenterStage, 'presenter-stage');
+  await presenterStage.goto(BASE, { waitUntil: 'domcontentloaded' });
+  await presenterStage.evaluate((secret) => {
+    sessionStorage.setItem(
+      'fluent.adminKey',
+      JSON.stringify({ key: secret, expiresAt: Date.now() + 24 * 60 * 60 * 1000 })
+    );
+  }, SECRET);
+  await presenterStage.goto(`${BASE}/${created.slug}/present`, { waitUntil: 'domcontentloaded' });
+  const presenterNext = presenterStage.getByRole('button', { name: 'Next slide' });
+  await presenterNext.waitFor({ timeout: 10000 });
+  await presenterStage.getByText('Slide 1 / 2', { exact: true }).waitFor({ timeout: 10000 });
+  check('valid presenter key receives server-authorized controls', await presenterNext.isEnabled());
+  await presenterNext.click();
+  await presenterStage.getByText('Slide 2 / 2', { exact: true }).waitFor();
+  const presenterDrivenState = await (await fetch(`${BASE}/api/sessions/${created.slug}`)).json();
+  check(
+    'authenticated presenter UI changes the shared server slide',
+    presenterDrivenState.slideIndex === 1,
+    JSON.stringify(presenterDrivenState)
+  );
+
+  tolerateConnectionRefused = true;
+  await stopServer(server);
+  await presenterStage
+    .getByRole('status')
+    .filter({ hasText: 'Reconnecting to stage…' })
+    .waitFor({ timeout: 5000 });
+  check(
+    'presenter controls disappear immediately on disconnect',
+    (await presenterStage.getByRole('button', { name: 'Next slide' }).count()) === 0
+  );
+  server = startServer();
+  server.stderr.on('data', (d) => process.env.SMOKE_DEBUG && console.error(String(d)));
+  check('server restarts during presenter reconnect test', await waitForHealth());
+  await presenterStage.getByRole('button', { name: 'Next slide' }).waitFor({ timeout: 15000 });
+  tolerateConnectionRefused = false;
+  check('presenter controls return only after reconnect authorization', true);
+  await rejectedStage.close();
+  await presenterStage.close();
 
   const interactiveHost = await connectHost(created.slug);
   interactiveHost.send('poll.open', {
@@ -359,7 +627,7 @@ try {
   check('Google Analytics is not loaded without VITE_GA_MEASUREMENT_ID', analyticsRequests.length === 0, analyticsRequests.join('\n'));
   check(
     'browser console has no unexpected errors',
-    consoleErrors.length === 0,
+    consoleErrors.length === 0 && missingResponses.length === 0,
     [...consoleErrors, ...missingResponses.map((url) => `404 ${url}`)].join('\n')
   );
 } catch (err) {
