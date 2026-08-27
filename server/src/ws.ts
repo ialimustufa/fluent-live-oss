@@ -168,6 +168,10 @@ function handleConnection(
         ws.send(envelope('snapshot', room.nextSeq(), snapshotForConnection(room, true)));
         room.sendToHost('presence', { viewerCount: room.viewers.size });
       } else if (payload.role === 'viewer') {
+        if (!room.audienceEnabled) {
+          ws.close(4403, 'audience disabled');
+          return;
+        }
         // Enforce the viewer cap configured for this room.
         if (!room.canAcceptViewer()) {
           ws.close(4409, 'viewer limit reached');

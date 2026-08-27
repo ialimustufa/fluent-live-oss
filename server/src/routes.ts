@@ -18,6 +18,7 @@ import {
   deleteSession,
   getPollResults,
   getReactionTallies,
+  type SessionRow,
 } from './db.js';
 import { isSupportedLanguage, SUPPORTED_LANGUAGES } from './languages.js';
 import { getRoom, deleteRoom } from './rooms.js';
@@ -95,6 +96,13 @@ function parseSlideCount(value: string | undefined): number | null | 'invalid' {
   return n;
 }
 
+function parseBooleanField(value: unknown, fallback: boolean): boolean | null {
+  if (value === undefined || value === '') return fallback;
+  if (value === true || value === 'true') return true;
+  if (value === false || value === 'false') return false;
+  return null;
+}
+
 export function registerRoutes(app: FastifyInstance, env: Env, deps: RouteDeps): void {
   const { slideStorage, audioFanout, wakeSlideCleanup } = deps;
   const publicGetLimiter = createFixedWindow({
@@ -124,6 +132,20 @@ export function registerRoutes(app: FastifyInstance, env: Env, deps: RouteDeps):
     if (publicGetLimiter.consume(clientIp(req))) return true;
     reply.code(429).send({ error: 'too many requests, slow down' });
     return false;
+  }
+
+  /** Audience-enabled sessions are public. Full speaker-only session details,
+   *  transcripts, and polls require the operator credential used by the host. */
+  function allowSessionRead(req: FastifyRequest, reply: FastifyReply, session: SessionRow): boolean {
+    if (session.audience_enabled === 1) return allowPublicGet(req, reply);
+    if (!req.headers.authorization) {
+      reply.code(403).send({
+        error: 'this is a speaker-only session',
+        code: 'audience_disabled',
+      });
+      return false;
+    }
+    return requireAdmin(req, reply);
   }
 
   async function cleanupTempUpload(upload: TempUpload | null): Promise<void> {
@@ -221,6 +243,14 @@ export function registerRoutes(app: FastifyInstance, env: Env, deps: RouteDeps):
     } else {
       Object.assign(fields, (req.body ?? {}) as Record<string, string>);
     }
+
+    const audienceEnabled = parseBooleanField(fields.audienceEnabled, true);
+    if (audienceEnabled === null) {
+      await cleanupTempUpload(upload);
+      reply.code(400).send({ error: 'audienceEnabled must be true or false' });
+      return null;
+    }
+    fields.audienceEnabled = String(audienceEnabled);
 
     const targetLang = (fields.targetLang ?? '').trim();
     const slideType = (fields.slideType ?? '').trim();
@@ -352,12 +382,14 @@ export function registerRoutes(app: FastifyInstance, env: Env, deps: RouteDeps):
         slide_count: parsed.slideCount,
         echo_target_language: fields.echoTargetLanguage === 'true',
         presentation_mode: fields.presentationMode === 'remote' ? 'remote' : 'in_person',
+        audience_enabled: fields.audienceEnabled !== 'false',
       });
 
       return {
         slug: session.slug,
         viewerPath: `/${session.slug}`,
         hostPath: `/${session.slug}/host`,
+        audienceEnabled: session.audience_enabled === 1,
       };
     } catch (err) {
       await cleanupParsedUpload(parsed);
@@ -398,9 +430,9 @@ export function registerRoutes(app: FastifyInstance, env: Env, deps: RouteDeps):
     }
   });
 
-  /** Public session info for viewer/host pages. Never includes secrets. */
+  /** Session info for viewer/host pages. Speaker-only sessions expose only a
+   *  content-free public marker so audience routes can stop cleanly. */
   app.get('/api/sessions/:slug', async (req, reply) => {
-    if (!allowPublicGet(req, reply)) return;
     const { slug } = req.params as { slug: string };
     if (!SLUG_ALPHABET_RE.test(slug)) {
       reply.code(400).send({ error: 'bad slug' });
@@ -411,6 +443,25 @@ export function registerRoutes(app: FastifyInstance, env: Env, deps: RouteDeps):
       reply.code(404).send({ error: 'session not found' });
       return;
     }
+    if (session.audience_enabled !== 1 && !req.headers.authorization) {
+      if (!allowPublicGet(req, reply)) return;
+      return {
+        slug: session.slug,
+        title: 'Speaker-only session',
+        targetLang: '',
+        slideType: 'html',
+        slideUrl: '',
+        slideCount: null,
+        state: 'created',
+        slideIndex: 0,
+        startedAt: null,
+        endedAt: null,
+        presentationMode: 'in_person',
+        audienceEnabled: false,
+        audio: { transport: 'none', available: false, reason: 'audience_disabled' },
+      };
+    }
+    if (!allowSessionRead(req, reply, session)) return;
     const room = getRoom(slug);
     const slideUrl =
       session.slide_type === 'pdf'
@@ -428,7 +479,11 @@ export function registerRoutes(app: FastifyInstance, env: Env, deps: RouteDeps):
       startedAt: session.started_at,
       endedAt: session.ended_at,
       presentationMode: session.presentation_mode,
-      audio: audioFanout.infoForSession(session),
+      audienceEnabled: session.audience_enabled === 1,
+      audio:
+        session.audience_enabled === 1
+          ? audioFanout.infoForSession(session)
+          : { transport: 'none', available: false, reason: 'audience_disabled' },
     };
   });
 
@@ -442,6 +497,13 @@ export function registerRoutes(app: FastifyInstance, env: Env, deps: RouteDeps):
     const session = getSessionBySlug(slug);
     if (!session) {
       reply.code(404).send({ error: 'session not found' });
+      return;
+    }
+    if (session.audience_enabled !== 1) {
+      reply.code(403).send({
+        error: 'viewer audio is disabled for this speaker-only session',
+        code: 'audience_disabled',
+      });
       return;
     }
 
@@ -477,15 +539,15 @@ export function registerRoutes(app: FastifyInstance, env: Env, deps: RouteDeps):
     }
   });
 
-  /** Public bilingual transcript (spec §6: /{slug}/transcript is public). */
+  /** Public for audience-enabled sessions; operator-only for speaker-only sessions. */
   app.get('/api/sessions/:slug/transcript', async (req, reply) => {
-    if (!allowPublicGet(req, reply)) return;
     const { slug } = req.params as { slug: string };
     const session = getSessionBySlug(slug);
     if (!session) {
       reply.code(404).send({ error: 'session not found' });
       return;
     }
+    if (!allowSessionRead(req, reply, session)) return;
     const rows = getTranscripts(session.id);
     return {
       title: session.title,
@@ -505,13 +567,13 @@ export function registerRoutes(app: FastifyInstance, env: Env, deps: RouteDeps):
 
   /** Public: poll questions + final results (for the post-talk transcript page). */
   app.get('/api/sessions/:slug/polls', async (req, reply) => {
-    if (!allowPublicGet(req, reply)) return;
     const { slug } = req.params as { slug: string };
     const session = getSessionBySlug(slug);
     if (!session) {
       reply.code(404).send({ error: 'session not found' });
       return;
     }
+    if (!allowSessionRead(req, reply, session)) return;
     return { polls: getPollResults(session.id) };
   });
 
@@ -574,6 +636,7 @@ export function registerRoutes(app: FastifyInstance, env: Env, deps: RouteDeps):
       attendeeCount: s.attendee_count,
       liveViewers: getRoom(s.slug)?.viewers.size ?? 0,
       presentationMode: s.presentation_mode,
+      audienceEnabled: s.audience_enabled === 1,
     }));
   });
 

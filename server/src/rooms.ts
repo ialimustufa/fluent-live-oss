@@ -118,8 +118,12 @@ export class Room {
     return ++this.seq;
   }
 
+  get audienceEnabled(): boolean {
+    return this.session.audience_enabled === 1;
+  }
+
   canAcceptViewer(): boolean {
-    return this.viewers.size < this.maxViewers;
+    return this.audienceEnabled && this.viewers.size < this.maxViewers;
   }
 
   // --- fan-out helpers ---
@@ -288,9 +292,11 @@ export class Room {
     // history (recentFinals + DB persist; offsets stay anchored to the start).
     const resuming = this.state === 'ended';
     this.clearPauseTimer();
-    void audioFanout?.startSession(this.session.slug).catch((err) => {
-      console.error(`[rooms] audio fanout failed to start for ${this.session.slug}:`, err);
-    });
+    if (this.audienceEnabled) {
+      void audioFanout?.startSession(this.session.slug).catch((err) => {
+        console.error(`[rooms] audio fanout failed to start for ${this.session.slug}:`, err);
+      });
+    }
     if (!this.bridge) {
       this.bridge = this.createBridge();
       void this.bridge.start();
@@ -316,7 +322,7 @@ export class Room {
     this.clearPauseTimer();
     this.bridge?.close();
     this.bridge = null;
-    void audioFanout?.close(this.session.slug);
+    if (this.audienceEnabled) void audioFanout?.close(this.session.slug);
     // Flush in-progress watch time so post-session analytics are complete even
     // for viewers still connected at stop; reset their clocks to avoid double count.
     this.flushWatchTime();
@@ -448,27 +454,29 @@ export class Room {
           };
           // Runs inside the Gemini SDK callback; a throw here would surface as an
           // uncaughtException (→ server shutdown), so isolate the fanout path.
-          try {
-            audioFanout?.publishTranslated(
-              this.session.slug,
-              data,
-              metadata && audioSyncMetadata
-                ? {
-                    track: 'translated',
-                    streamId: metadata.streamId,
-                    audioSeq: metadata.audioSeq,
-                    audioStartMs: metadata.audioStartMs,
-                    durationMs: metadata.durationMs,
-                    onSent: (marker: AudioMarkerPayload) => {
-                      this.broadcast('audio.marker', marker);
-                      this.recordAudioSync(metadata, marker.serverSentAtMs);
-                    },
-                  }
-                : undefined
-            );
-          } catch (err) {
-            this.audioSyncStats.sfuPublishErrors += 1;
-            console.error(`[rooms] audio fanout publish failed for ${this.session.slug}:`, err);
+          if (this.audienceEnabled) {
+            try {
+              audioFanout?.publishTranslated(
+                this.session.slug,
+                data,
+                metadata && audioSyncMetadata
+                  ? {
+                      track: 'translated',
+                      streamId: metadata.streamId,
+                      audioSeq: metadata.audioSeq,
+                      audioStartMs: metadata.audioStartMs,
+                      durationMs: metadata.durationMs,
+                      onSent: (marker: AudioMarkerPayload) => {
+                        this.broadcast('audio.marker', marker);
+                        this.recordAudioSync(metadata, marker.serverSentAtMs);
+                      },
+                    }
+                  : undefined
+              );
+            } catch (err) {
+              this.audioSyncStats.sfuPublishErrors += 1;
+              console.error(`[rooms] audio fanout publish failed for ${this.session.slug}:`, err);
+            }
           }
           // Keep the host PA/monitor path on the app WS; viewer fanout is SFU.
           this.sendToHost('audio.out', audioPayload);
@@ -606,7 +614,7 @@ function teardownRoom(slug: string, code = 4001, reason = 'session deleted'): vo
   if (!room) return;
   room.bridge?.close();
   room.bridge = null;
-  void audioFanout?.close(slug);
+  if (room.audienceEnabled) void audioFanout?.close(slug);
   room.host?.close(code, reason);
   for (const v of room.viewers) v.close(code, reason);
   rooms.delete(slug);

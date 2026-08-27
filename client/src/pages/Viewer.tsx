@@ -33,10 +33,31 @@ function useIsPortrait(): boolean {
   return portrait;
 }
 
+function SpeakerOnlyNotice() {
+  return (
+    <div className="bg-aurora flex min-h-screen flex-col items-center justify-center gap-4 px-6 text-center">
+      <div className="animate-fade-up glass-panel flex max-w-sm flex-col items-center gap-4 rounded-3xl px-10 py-12">
+        <div className="flex h-14 w-14 items-center justify-center rounded-[var(--r-lg)] bg-[var(--surface-2)] text-[var(--cyan)] ring-1 ring-inset ring-[var(--border)]">
+          <Lock size={26} />
+        </div>
+        <h1 className="text-xl font-semibold text-[var(--fg)]">Speaker-only session</h1>
+        <p className="text-sm leading-relaxed text-[var(--muted)]">
+          This session is playing translated audio on the presenter&apos;s stage computer. Audience
+          viewing and participation are not enabled.
+        </p>
+        <Link to="/" className="btn-ghost rounded-xl px-6 py-2.5">
+          Back to Fluent
+        </Link>
+      </div>
+    </div>
+  );
+}
+
 export default function Viewer() {
   const { slug = '' } = useParams();
   const [session, setSession] = useState<SessionInfo | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [speakerOnly, setSpeakerOnly] = useState(false);
   const [profile, setProfile] = useState<ViewerProfile | null>(getViewerProfile);
   const [state, setState] = useState<string>('created');
   const [slideIndex, setSlideIndex] = useState(0);
@@ -93,13 +114,18 @@ export default function Viewer() {
     setActivated(false);
     setMuted(true);
     setAudioError(null);
+    setLoadError(null);
+    setSpeakerOnly(false);
     fetchSession(slug)
       .then((s) => {
         setSession(s);
         setState(s.state);
         setSlideIndex(s.slideIndex);
       })
-      .catch((e) => setLoadError(String(e.message ?? e)));
+      .catch((e) => {
+        if ((e as { code?: string }).code === 'audience_disabled') setSpeakerOnly(true);
+        else setLoadError(String(e.message ?? e));
+      });
   }, [slug]);
 
   useEffect(
@@ -123,7 +149,7 @@ export default function Viewer() {
   // Connect only once the viewer has entered (onboarding done) — so attendance
   // counts real attendees and carries their id/name/company.
   useEffect(() => {
-    if (!session || !profile) return;
+    if (!session || !profile || session.audienceEnabled === false) return;
     const sock = new SessionSocket(slug, 'viewer', undefined, {
       viewerId: profile.viewerId,
       name: profile.name,
@@ -272,6 +298,9 @@ export default function Viewer() {
         Session not found.
       </div>
     );
+  }
+  if (speakerOnly || session?.audienceEnabled === false) {
+    return <SpeakerOnlyNotice />;
   }
   if (!session) {
     return (

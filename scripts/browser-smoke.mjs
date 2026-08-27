@@ -110,10 +110,11 @@ async function waitForHealth(timeoutMs = 10000) {
   return false;
 }
 
-async function createPdfSession(title = 'Browser Smoke PDF') {
+async function createPdfSession(title = 'Browser Smoke PDF', { audienceEnabled = true } = {}) {
   const form = new FormData();
   form.set('title', title);
   form.set('targetLang', 'es');
+  form.set('audienceEnabled', String(audienceEnabled));
   form.set('slideType', 'pdf');
   form.set('file', new File([makePdf()], 'browser-smoke.pdf', { type: 'application/pdf' }));
   const res = await fetch(`${BASE}/api/sessions`, {
@@ -276,6 +277,7 @@ let browser;
 try {
   check('bootstrap server health is ready', await waitForHealth());
   const created = await createPdfSession();
+  const speakerCreated = await createPdfSession('Browser Smoke Speaker Stage', { audienceEnabled: false });
   await stopServer(server);
 
   server = startServer();
@@ -659,6 +661,38 @@ try {
     'attendance refresh button fetches analytics once',
     hostAnalyticsRequests.length === beforeManualRefresh + 1,
     hostAnalyticsRequests.join('\n')
+  );
+
+  const beforeSpeakerHostAnalytics = hostAnalyticsRequests.length;
+  await page.goto(`${BASE}${speakerCreated.hostPath}`, { waitUntil: 'domcontentloaded' });
+  await page.getByText('Speaker only', { exact: true }).waitFor({ timeout: 15000 });
+  await page.waitForTimeout(250);
+  check(
+    'speaker-only host renders local stage controls without audience UI',
+    (await page.getByText('Local stage output', { exact: true }).isVisible()) &&
+      (await page.getByRole('button', { name: /^Polls$/i }).count()) === 0 &&
+      (await page.getByRole('button', { name: /^Analytics$/i }).count()) === 0 &&
+      (await page.getByText('Audience link', { exact: true }).count()) === 0 &&
+      (await page.getByText("Viewers' phones only", { exact: true }).count()) === 0
+  );
+  check(
+    'speaker-only host does not request attendance analytics',
+    hostAnalyticsRequests.length === beforeSpeakerHostAnalytics,
+    hostAnalyticsRequests.slice(beforeSpeakerHostAnalytics).join('\n')
+  );
+
+  await page.goto(`${BASE}/${speakerCreated.slug}`, { waitUntil: 'domcontentloaded' });
+  await page.getByRole('heading', { name: /speaker-only session/i }).waitFor({ timeout: 5000 });
+  check(
+    'speaker-only viewer route stops before onboarding',
+    (await page.getByRole('button', { name: /Enter the room/i }).count()) === 0
+  );
+
+  await page.goto(`${BASE}/${speakerCreated.slug}/present`, { waitUntil: 'domcontentloaded' });
+  await page.waitForURL(`${BASE}${speakerCreated.hostPath}`, { timeout: 5000 });
+  check(
+    'speaker-only projector route returns to the microphone-owning speaker console',
+    new URL(page.url()).pathname === speakerCreated.hostPath
   );
 
   await endSession(created.slug);

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { Building2, Check, Globe } from 'lucide-react';
+import { Building2, Check, Globe, Volume2 } from 'lucide-react';
 import { createSession, fetchLanguages, type Language } from '../lib/api';
 import { getAdminKey } from '../lib/adminKey';
 import AdminKeyGate from '../components/AdminKeyGate';
@@ -20,6 +20,7 @@ function NewSessionInner() {
   const [title, setTitle] = useState('');
   const [targetLang, setTargetLang] = useState('es');
   const [presentationMode, setPresentationMode] = useState<'in_person' | 'remote'>('in_person');
+  const [audienceEnabled, setAudienceEnabled] = useState(true);
   const [slideType, setSlideType] = useState<'pdf' | 'gslides' | 'html'>('pdf');
   const [file, setFile] = useState<File | null>(null);
   const [slideUrl, setSlideUrl] = useState('');
@@ -27,7 +28,12 @@ function NewSessionInner() {
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [created, setCreated] = useState<{ slug: string; viewerPath: string; hostPath: string } | null>(null);
+  const [created, setCreated] = useState<{
+    slug: string;
+    viewerPath: string;
+    hostPath: string;
+    audienceEnabled: boolean;
+  } | null>(null);
 
   useEffect(() => {
     void fetchLanguages().then(setLanguages);
@@ -42,6 +48,7 @@ function NewSessionInner() {
       form.set('title', title);
       form.set('targetLang', targetLang);
       form.set('presentationMode', presentationMode);
+      form.set('audienceEnabled', String(audienceEnabled));
       form.set('slideType', slideType);
       form.set('echoTargetLanguage', String(echoTarget));
       if (slideType === 'pdf') {
@@ -68,26 +75,37 @@ function NewSessionInner() {
           <div className="grad-fill mx-auto flex h-12 w-12 items-center justify-center rounded-2xl">
             <Check size={24} strokeWidth={2.25} />
           </div>
-          <h1 className="text-xl font-semibold text-[var(--fg)]">Session ready</h1>
-          <div className="flex justify-center">
-            <QrCode url={viewerUrl} size={200} />
-          </div>
-          <div className="text-left">
-            <p className="mb-1.5 text-xs font-medium uppercase tracking-wide text-[var(--faint)]">
-              Audience URL — share or project the QR
-            </p>
-            <div className="flex gap-2">
-              <input readOnly value={viewerUrl} className="input-field min-w-0 flex-1 px-3 py-2 text-sm" />
-              <button
-                onClick={() => void navigator.clipboard.writeText(viewerUrl)}
-                className="btn-ghost rounded-xl px-4 py-2 text-sm"
-              >
-                Copy
-              </button>
+          <h1 className="text-xl font-semibold text-[var(--fg)]">
+            {created.audienceEnabled ? 'Session ready' : 'Speaker-only session ready'}
+          </h1>
+          {created.audienceEnabled ? (
+            <>
+              <div className="flex justify-center">
+                <QrCode url={viewerUrl} size={200} />
+              </div>
+              <div className="text-left">
+                <p className="mb-1.5 text-xs font-medium uppercase tracking-wide text-[var(--faint)]">
+                  Audience URL — share or project the QR
+                </p>
+                <div className="flex gap-2">
+                  <input readOnly value={viewerUrl} className="input-field min-w-0 flex-1 px-3 py-2 text-sm" />
+                  <button
+                    onClick={() => void navigator.clipboard.writeText(viewerUrl)}
+                    className="btn-ghost rounded-xl px-4 py-2 text-sm"
+                  >
+                    Copy
+                  </button>
+                </div>
+              </div>
+            </>
+          ) : (
+            <div className="rounded-[var(--r-lg)] bg-[var(--surface-2)] px-4 py-3 text-left text-sm leading-relaxed text-[var(--muted)] ring-1 ring-inset ring-[var(--border)]">
+              Audience access is off. Open the speaker console on the stage computer to play translated
+              audio through its selected speaker or PA output.
             </div>
-          </div>
+          )}
           <Link to={created.hostPath} className="btn-primary block w-full rounded-xl py-3">
-            Open host console
+            {created.audienceEnabled ? 'Open host console' : 'Open speaker console'}
           </Link>
         </div>
       </div>
@@ -103,7 +121,7 @@ function NewSessionInner() {
       >
         <div>
           <h1 className="text-2xl font-bold text-[var(--fg)]">New presentation</h1>
-          <p className="mt-1 text-sm text-[var(--faint)]">Set your audience's language and slides.</p>
+          <p className="mt-1 text-sm text-[var(--faint)]">Set the translation language, stage mode, and slides.</p>
         </div>
 
         <div>
@@ -117,7 +135,7 @@ function NewSessionInner() {
         </div>
 
         <div>
-          <label className="mb-1.5 block text-sm font-medium text-[var(--muted)]">Audience language</label>
+          <label className="mb-1.5 block text-sm font-medium text-[var(--muted)]">Translation language</label>
           <select
             value={targetLang}
             onChange={(e) => setTargetLang(e.target.value)}
@@ -133,27 +151,44 @@ function NewSessionInner() {
 
         <div>
           <label className="mb-1.5 block text-sm font-medium text-[var(--muted)]">Presentation mode</label>
-          <div className="mb-2 flex gap-1 rounded-xl bg-[var(--surface-2)] p-1 text-sm ring-1 ring-inset ring-[var(--border)]">
-            {(['in_person', 'remote'] as const).map((m) => (
+          <div className="mb-2 grid grid-cols-3 gap-1 rounded-xl bg-[var(--surface-2)] p-1 text-sm ring-1 ring-inset ring-[var(--border)]">
+            {(['speaker_only', 'in_person', 'remote'] as const).map((m) => (
               <button
                 key={m}
                 type="button"
-                onClick={() => setPresentationMode(m)}
+                onClick={() => {
+                  if (m === 'speaker_only') {
+                    setAudienceEnabled(false);
+                    setPresentationMode('in_person');
+                  } else {
+                    setAudienceEnabled(true);
+                    setPresentationMode(m);
+                  }
+                }}
                 className={`flex-1 rounded-lg py-2 font-medium transition ${
-                  presentationMode === m
+                  (!audienceEnabled && m === 'speaker_only') ||
+                  (audienceEnabled && presentationMode === m)
                     ? 'grad-fill shadow-sm'
                     : 'text-[var(--faint)] hover:text-[var(--muted)]'
                 }`}
               >
                 <span className="flex items-center justify-center gap-1.5">
-                  {m === 'in_person' ? <Building2 size={16} /> : <Globe size={16} />}
-                  {m === 'in_person' ? 'In-person' : 'Remote'}
+                  {m === 'speaker_only' ? (
+                    <Volume2 size={16} />
+                  ) : m === 'in_person' ? (
+                    <Building2 size={16} />
+                  ) : (
+                    <Globe size={16} />
+                  )}
+                  {m === 'speaker_only' ? 'Speaker only' : m === 'in_person' ? 'In-person' : 'Remote'}
                 </span>
               </button>
             ))}
           </div>
           <p className="text-xs leading-relaxed text-[var(--faint)]">
-            {presentationMode === 'in_person'
+            {!audienceEnabled
+              ? 'Translated audio plays through this computer or the room PA. No audience room, viewer link, or attendance tracking is created.'
+              : presentationMode === 'in_person'
               ? 'Audio plays through the room PA (your laptop output); viewers see captions + slides on their phones (audio is an opt-in). Use the /present view to project.'
               : 'Each viewer hears the translated audio on their own device. Best for online/hybrid audiences.'}
           </p>

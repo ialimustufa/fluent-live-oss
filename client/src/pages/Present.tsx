@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Link, useParams } from 'react-router-dom';
+import { Link, Navigate, useParams } from 'react-router-dom';
 import { MessageSquare, X, BarChart3, ChevronLeft, ChevronRight } from 'lucide-react';
 import { fetchSession, type SessionInfo } from '../lib/api';
 import { SessionSocket, type SessionSnapshotPayload } from '../lib/ws';
@@ -50,17 +50,19 @@ export default function Present() {
   const auth = getAdminKey() ?? '';
 
   useEffect(() => {
-    fetchSession(slug)
+    fetchSession(slug, auth || undefined)
       .then((s) => {
         setSession(s);
         setState(s.state);
         setSlideIndex(s.slideIndex);
       })
       .catch((e) => setError(String(e.message ?? e)));
-  }, [slug]);
+  }, [auth, slug]);
 
   useEffect(() => {
-    if (!session) return;
+    // Speaker-only sessions use the Host as their single stage surface. Do not
+    // join this page as a viewer, since that would create audience presence.
+    if (!session || session.audienceEnabled === false) return;
     let active = true;
     setCanPresent(false);
     setAuthorizationResolved(false);
@@ -157,6 +159,9 @@ export default function Present() {
   }
   if (!session) {
     return <div className="bg-aurora flex min-h-screen items-center justify-center text-[var(--faint)]">Loading…</div>;
+  }
+  if (session.audienceEnabled === false) {
+    return <Navigate replace to={`/${slug}/host`} />;
   }
 
   const atStart = slideIndex <= 0;

@@ -18,6 +18,7 @@ export interface SessionRow {
   ended_at: string | null;
   peak_viewers: number;
   presentation_mode: 'in_person' | 'remote';
+  audience_enabled: number;
 }
 
 export interface AttendeeRow {
@@ -237,7 +238,8 @@ export function initDb(databasePath: string): InitDbResult {
       started_at TEXT,
       ended_at TEXT,
       peak_viewers INTEGER NOT NULL DEFAULT 0,
-      presentation_mode TEXT NOT NULL DEFAULT 'in_person' CHECK (presentation_mode IN ('in_person','remote'))
+      presentation_mode TEXT NOT NULL DEFAULT 'in_person' CHECK (presentation_mode IN ('in_person','remote')),
+      audience_enabled INTEGER NOT NULL DEFAULT 1 CHECK (audience_enabled IN (0,1))
     );
 
     CREATE TABLE IF NOT EXISTS transcripts (
@@ -316,6 +318,9 @@ export function initDb(databasePath: string): InitDbResult {
   }
   if (!cols.some((c) => c.name === 'presentation_mode')) {
     db.exec(`ALTER TABLE sessions ADD COLUMN presentation_mode TEXT NOT NULL DEFAULT 'in_person'`);
+  }
+  if (!cols.some((c) => c.name === 'audience_enabled')) {
+    db.exec(`ALTER TABLE sessions ADD COLUMN audience_enabled INTEGER NOT NULL DEFAULT 1`);
   }
   // polls.correct added after polls shipped without it.
   const pollCols = db.prepare(`PRAGMA table_info(polls)`).all() as { name: string }[];
@@ -407,18 +412,20 @@ export function createSession(row: {
   slide_count: number | null;
   echo_target_language: boolean;
   presentation_mode?: 'in_person' | 'remote';
+  audience_enabled?: boolean;
 }): SessionRow {
   const database = getDb();
   database.transaction(() => {
     database
       .prepare(
-        `INSERT INTO sessions (slug, title, target_lang, slide_type, slide_ref, slide_count, echo_target_language, presentation_mode)
-         VALUES (@slug, @title, @target_lang, @slide_type, @slide_ref, @slide_count, @echo, @presentation_mode)`
+        `INSERT INTO sessions (slug, title, target_lang, slide_type, slide_ref, slide_count, echo_target_language, presentation_mode, audience_enabled)
+         VALUES (@slug, @title, @target_lang, @slide_type, @slide_ref, @slide_count, @echo, @presentation_mode, @audience_enabled)`
       )
       .run({
         ...row,
         echo: row.echo_target_language ? 1 : 0,
         presentation_mode: row.presentation_mode ?? 'in_person',
+        audience_enabled: row.audience_enabled === false ? 0 : 1,
       });
     // A successful attachment supersedes any stale failed-cleanup entry for
     // the same ref, and both changes commit atomically.

@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { fetchTranscript, fetchPolls, type TranscriptData, type TranscriptSegment, type PollResult } from '../lib/api';
+import { getAdminKey } from '../lib/adminKey';
 import PollResults from '../components/PollResults';
 
 function fmtOffset(ms: number): string {
@@ -25,14 +26,15 @@ function buildRows(segments: TranscriptSegment[]) {
 
 export default function TranscriptPage() {
   const { slug = '' } = useParams();
+  const auth = getAdminKey() ?? undefined;
   const [data, setData] = useState<TranscriptData | null>(null);
   const [polls, setPolls] = useState<PollResult[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    fetchTranscript(slug).then(setData).catch((e) => setError(String(e.message ?? e)));
-    fetchPolls(slug).then(setPolls).catch(() => {});
-  }, [slug]);
+    fetchTranscript(slug, auth).then(setData).catch((e) => setError(String(e.message ?? e)));
+    fetchPolls(slug, auth).then(setPolls).catch(() => {});
+  }, [auth, slug]);
 
   if (error) {
     return <div className="bg-aurora flex min-h-screen items-center justify-center text-[var(--muted)]">{error}</div>;
