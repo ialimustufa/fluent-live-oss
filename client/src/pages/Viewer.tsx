@@ -46,7 +46,7 @@ export default function Viewer() {
   const [activated, setActivated] = useState(false);
   const [muted, setMuted] = useState(true);
   const [volume, setVolume] = useState(1);
-  const [trialFull, setTrialFull] = useState(false);
+  const [sessionFull, setSessionFull] = useState(false);
   const [audioError, setAudioError] = useState<string | null>(null);
 
   const portrait = useIsPortrait();
@@ -131,7 +131,7 @@ export default function Viewer() {
     });
     sockRef.current = sock;
     sock.onClosed = (code) => {
-      if (code === 4409) setTrialFull(true); // trial viewer limit reached
+      if (code === 4409) setSessionFull(true); // session viewer limit reached
     };
     sock.onGaveUp = () => setAudioError('Connection lost. Please refresh the page.');
     sock.onMessage = (msg) => {
@@ -292,20 +292,19 @@ export default function Viewer() {
     );
   }
 
-  if (trialFull) {
+  if (sessionFull) {
     return (
       <div className="bg-aurora flex min-h-screen flex-col items-center justify-center gap-4 px-6 text-center">
         <div className="animate-fade-up glass-panel flex max-w-sm flex-col items-center gap-4 rounded-3xl px-10 py-12">
           <div className="flex h-14 w-14 items-center justify-center rounded-[var(--r-lg)] bg-info-soft text-info ring-1 ring-inset ring-info">
             <Lock size={26} />
           </div>
-          <h1 className="text-xl font-semibold text-[var(--fg)]">This trial is full</h1>
+          <h1 className="text-xl font-semibold text-[var(--fg)]">This session is full</h1>
           <p className="text-sm text-[var(--muted)]">
-            Trial sessions allow up to {session.trialMaxViewers ?? 10} viewers at a time. Ask the host to start a full session, or
-            try Fluent yourself.
+            This session has reached its viewer limit. Ask the host when a place becomes available.
           </p>
-          <Link to="/try" className="btn-primary rounded-xl px-6 py-2.5">
-            Try Fluent
+          <Link to="/" className="btn-primary rounded-xl px-6 py-2.5">
+            Back to Fluent
           </Link>
         </div>
       </div>

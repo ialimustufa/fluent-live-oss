@@ -102,8 +102,28 @@ For production, attach a custom domain to the bucket rather than using an
 
 ```text
 R2_PUBLIC_BASE_URL=https://cdn.example.com
+# Include any previous/secondary domain that exposed this bucket:
+R2_CACHE_PURGE_BASE_URLS=https://old-cdn.example.com
+R2_CACHE_PURGE_ZONE_ID=<custom-domain-zone-id>
+R2_CACHE_PURGE_API_TOKEN=<cache-purge-api-token>
 ASSET_CDN_BASE_URL=https://cdn.example.com
 ```
+
+Create the API token under **Manage Account > API Tokens** with the zone-level
+**Cache Purge** permission, scoped to the custom domain's zone. The server
+uploads PDFs with `Cache-Control: no-store`. When a PDF is deleted it also
+purges that generated filename by URL prefix (including cache-key variants),
+and keeps the durable cleanup record until both R2 deletion and cache purge
+succeed. Leave `R2_PUBLIC_BASE_URL` unset if the public domain cannot be purged
+this way.
+
+`R2_PUBLIC_BASE_URL` and `ASSET_CDN_BASE_URL` are added to the purge list
+automatically because either domain can expose a known `slides/` object in the
+shared bucket. Before upgrading, put every previous or secondary public bucket
+base in the comma-separated `R2_CACHE_PURGE_BASE_URLS` value. All listed
+hostnames must belong to `R2_CACHE_PURGE_ZONE_ID`; manually purge and remove any
+domain from another zone before the upgrade. Direct public delivery will not
+start without purge credentials.
 
 Set only `R2_PUBLIC_BASE_URL` if direct PDF delivery is wanted without moving
 compiled assets to the CDN. Set only `ASSET_CDN_BASE_URL` if only compiled
@@ -134,7 +154,8 @@ replacing the origin if needed:
 
 After changing CORS on an active custom domain, purge cached responses for that
 hostname so stale headers are not served. See Cloudflare's [public bucket](https://developers.cloudflare.com/r2/buckets/public-buckets/)
-and [CORS](https://developers.cloudflare.com/r2/buckets/cors/) documentation.
+and [CORS](https://developers.cloudflare.com/r2/buckets/cors/) documentation,
+plus the [prefix purge API](https://developers.cloudflare.com/cache/how-to/purge-cache/purge_by_prefix/).
 
 `ASSET_CDN_BASE_URL` is a build-time setting. The deployed `index.html` and the
 uploaded hashed assets must come from the same build. Render's blueprint runs
@@ -214,12 +235,6 @@ honoring applicable access or deletion requests. The application can persist:
 
 - attendee profiles: a viewer ID, optional name and company, join count, total
   watch time, and first-joined and last-seen timestamps;
-- beta leads: supplied and normalized email, full name, company, budget range,
-  linked session slug, duplicate-attempt counters, expedite requests, feedback,
-  and related timestamps;
-- trial rate-limit and abuse audit data: hashed IP/rate-limit keys, a short
-  Gemini-key hash prefix, supplied and normalized email, session slug, outcome,
-  reason, status, detail, and timestamps;
 - source and translated transcript text with language, timing, slide position,
   finalization state, and session association;
 - session metadata, poll votes tied to viewer IDs, reaction tallies, attendance
@@ -248,10 +263,14 @@ npm run restore -- --backup /data/backups/backup-name --force
 ```
 
 Each backup contains a complete SQLite copy and uploaded files, so it can retain
-attendee profiles, beta leads, abuse-audit records, transcripts, and decks after
-the live database is cleaned. Encrypt and access-control off-service copies,
-apply a documented expiry schedule to backups as well as primary data, and
-include backup copies in deletion and incident-response procedures.
+attendee profiles, transcripts, and decks after the live database is cleaned.
+Backups created by older releases can also retain data from the retired trial
+flows, including lead contact details, abuse-prevention hashes and audit rows,
+trial sessions, transcripts, attendee records, and uploaded decks. The upgrade
+removes those records from the active schema but does not rewrite historical
+backups. Encrypt and access-control off-service copies, apply a documented
+expiry schedule to backups as well as primary data, and include backup copies
+in deletion and incident-response procedures.
 
 The restore command keeps a safety copy of replaced data. Schedule recurring
 backups outside active talks, copy backups off the service disk, and monitor the

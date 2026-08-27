@@ -15,7 +15,7 @@ SQLite stores sessions and final transcripts.
 - PDF, published Google Slides, and external HTML deck support
 - Synchronized slides, polls, quizzes, reactions, and attendance analytics
 - Local-disk or Cloudflare R2 storage for uploaded PDFs
-- Admin-created sessions plus limited self-service trial flows
+- Admin-created presentation sessions
 - Backup, restore, preflight, server smoke, and browser smoke tooling
 
 ## Architecture
@@ -79,9 +79,9 @@ groups are:
 |---|---|
 | Required in production | `GEMINI_API_KEY`, `ADMIN_SECRET` |
 | App and persistence | `PUBLIC_ORIGIN`, `TRUST_PROXY`, `DATABASE_PATH`, `UPLOADS_DIR`, `PORT` |
-| Viewer limits | `MAX_VIEWERS_PER_SESSION`, `PUBLIC_GET_MAX`, `TRIAL_TTL_MS` |
+| Viewer limits | `MAX_VIEWERS_PER_SESSION`, `PUBLIC_GET_MAX` |
 | Cloudflare Realtime | `AUDIO_SUBSCRIPTION_ACTIVE`, `CF_REALTIME_APP_ID`, `CF_REALTIME_APP_SECRET` |
-| Cloudflare R2/CDN | `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`, `R2_PUBLIC_BASE_URL`, `ASSET_CDN_BASE_URL` |
+| Cloudflare R2/CDN | `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`, `R2_PUBLIC_BASE_URL`, `R2_CACHE_PURGE_BASE_URLS`, `R2_CACHE_PURGE_ZONE_ID`, `R2_CACHE_PURGE_API_TOKEN`, `ASSET_CDN_BASE_URL` |
 | Optional telemetry | `SENTRY_DSN`, `VITE_GA_MEASUREMENT_ID` |
 
 Only `VITE_*` values are included in the client bundle. Never prefix server

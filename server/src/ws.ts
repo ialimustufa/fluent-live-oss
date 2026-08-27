@@ -12,7 +12,7 @@ import type { Server, IncomingMessage } from 'node:http';
 import type { Duplex } from 'node:stream';
 import crypto from 'node:crypto';
 import { checkAdminSecret, isRateLimited, recordAuthFailure } from './auth.js';
-import { getOrCreateRoom, getTrial, type Room } from './rooms.js';
+import { getOrCreateRoom, type Room } from './rooms.js';
 import { envelope, type Envelope, type HelloPayload } from './types.js';
 
 const HELLO_TIMEOUT_MS = 10_000;
@@ -141,12 +141,7 @@ function handleConnection(
           ws.close(4429, 'rate limited');
           return;
         }
-        // Trial sessions authenticate the host with their per-session token;
-        // everything else requires the shared ADMIN_SECRET.
-        const trial = getTrial(slug);
-        const ok = trial
-          ? checkAdminSecret(payload.auth, trial.hostToken)
-          : checkAdminSecret(payload.auth, adminSecret);
+        const ok = checkAdminSecret(payload.auth, adminSecret);
         if (!ok) {
           recordAuthFailure(ip);
           ws.close(4401, 'unauthorized');
@@ -167,14 +162,10 @@ function handleConnection(
           return;
         }
         role = 'viewer';
-        // Grant slide control to a viewer that supplied a valid presenter token
-        // (admin secret, or the trial host token). No auth failure is recorded:
-        // ordinary viewers send none and stay read-only.
+        // Grant slide control to a viewer that supplied the admin secret. No
+        // auth failure is recorded: ordinary viewers send none and stay read-only.
         if (typeof payload.auth === 'string' && payload.auth) {
-          const trial = getTrial(slug);
-          canPresent = trial
-            ? checkAdminSecret(payload.auth, trial.hostToken)
-            : checkAdminSecret(payload.auth, adminSecret);
+          canPresent = checkAdminSecret(payload.auth, adminSecret);
         }
         room.viewers.add(ws);
         room.recordViewerJoin(ws, {

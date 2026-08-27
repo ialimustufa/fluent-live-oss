@@ -6,6 +6,7 @@
 import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
+import os from 'node:os';
 import path from 'node:path';
 import WebSocket from 'ws';
 import Database from 'better-sqlite3';
@@ -23,13 +24,16 @@ const env = {
   GEMINI_API_KEY: 'fake-key-for-smoke-test',
   DATABASE_PATH: path.join(DATA, 'app.db'),
   UPLOADS_DIR: path.join(DATA, 'uploads'),
-  TRIAL_TTL_MS: '700',
-  VALIDATE_TRIAL_GEMINI_KEYS: 'false',
   PUBLIC_ORIGIN: '',
   AUDIO_SUBSCRIPTION_ACTIVE: 'false',
   CF_REALTIME_APP_ID: '',
   CF_REALTIME_APP_SECRET: '',
   CF_REALTIME_API_BASE: '',
+  R2_PUBLIC_BASE_URL: '',
+  R2_CACHE_PURGE_BASE_URLS: '',
+  R2_CACHE_PURGE_ZONE_ID: '',
+  R2_CACHE_PURGE_API_TOKEN: '',
+  ASSET_CDN_BASE_URL: '',
   MAX_VIEWERS_PER_SESSION: '500',
 };
 
@@ -309,6 +313,323 @@ console.log('\n[0] SFU audio packet pacing math');
   check('empty input yields no frames', pcm24kMonoBase64ToSfuFrames('') .length === 0);
 }
 
+// ---- Test 0a: upgrading a legacy database removes only retired trial data.
+console.log('\n[0a] Legacy trial schema retirement');
+{
+  const legacyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fluent-legacy-migration-'));
+  const legacyPath = path.join(legacyDir, 'app.db');
+  let openDb = null;
+
+  try {
+    openDb = new Database(legacyPath);
+    openDb.exec(`
+      CREATE TABLE sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        slug TEXT NOT NULL UNIQUE,
+        title TEXT NOT NULL DEFAULT '',
+        target_lang TEXT NOT NULL,
+        slide_type TEXT NOT NULL CHECK (slide_type IN ('pdf','gslides','html')),
+        slide_ref TEXT NOT NULL,
+        slide_count INTEGER,
+        echo_target_language INTEGER NOT NULL DEFAULT 0,
+        state TEXT NOT NULL DEFAULT 'created' CHECK (state IN ('created','live','paused','ended')),
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        started_at TEXT,
+        ended_at TEXT,
+        peak_viewers INTEGER NOT NULL DEFAULT 0,
+        is_trial INTEGER NOT NULL DEFAULT 0,
+        trial_type TEXT NOT NULL DEFAULT 'none',
+        presentation_mode TEXT NOT NULL DEFAULT 'in_person'
+      );
+      CREATE TABLE transcripts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id INTEGER NOT NULL REFERENCES sessions(id),
+        kind TEXT NOT NULL,
+        language_code TEXT NOT NULL,
+        text TEXT NOT NULL,
+        is_final INTEGER NOT NULL DEFAULT 1,
+        t_offset_ms INTEGER NOT NULL,
+        slide_index INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE TABLE attendees (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id INTEGER NOT NULL REFERENCES sessions(id),
+        viewer_id TEXT NOT NULL,
+        name TEXT NOT NULL DEFAULT '',
+        company TEXT NOT NULL DEFAULT '',
+        joins INTEGER NOT NULL DEFAULT 0,
+        total_ms INTEGER NOT NULL DEFAULT 0,
+        first_joined_at TEXT NOT NULL DEFAULT (datetime('now')),
+        last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(session_id, viewer_id)
+      );
+      CREATE TABLE polls (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id INTEGER NOT NULL REFERENCES sessions(id),
+        poll_id TEXT NOT NULL,
+        question TEXT NOT NULL,
+        options TEXT NOT NULL,
+        correct TEXT NOT NULL DEFAULT '[]',
+        started_at TEXT NOT NULL DEFAULT (datetime('now')),
+        ended_at TEXT,
+        UNIQUE(session_id, poll_id)
+      );
+      CREATE TABLE poll_votes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id INTEGER NOT NULL REFERENCES sessions(id),
+        poll_id TEXT NOT NULL,
+        viewer_id TEXT NOT NULL,
+        option_index INTEGER NOT NULL,
+        voted_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(session_id, poll_id, viewer_id)
+      );
+      CREATE TABLE reaction_tallies (
+        session_id INTEGER NOT NULL REFERENCES sessions(id),
+        emoji TEXT NOT NULL,
+        count INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(session_id, emoji)
+      );
+      CREATE TABLE beta_leads (id INTEGER PRIMARY KEY, email TEXT NOT NULL);
+      CREATE TABLE trial_rate_limits (scope TEXT NOT NULL, key_hash TEXT NOT NULL);
+      CREATE TABLE trial_abuse_events (id INTEGER PRIMARY KEY, detail TEXT NOT NULL);
+
+      INSERT INTO sessions (
+        id, slug, title, target_lang, slide_type, slide_ref, is_trial, trial_type
+      ) VALUES
+        (1, 'normal-row', 'Normal session', 'es', 'pdf', 'normal-slide.pdf', 0, 'none'),
+        (2, 'legacy-try', 'Legacy own-key trial', 'es', 'pdf', 'aaaaaaaaaaaa.pdf', 1, 'try'),
+        (3, 'legacy-beta', 'Legacy hosted trial', 'es', 'pdf', 'bbbbbbbbbbbb.pdf', 1, 'beta'),
+        (4, 'normal-shared', 'Normal shared deck', 'es', 'pdf', 'bbbbbbbbbbbb.pdf', 0, 'none');
+
+      INSERT INTO transcripts (session_id, kind, language_code, text, t_offset_ms)
+        VALUES (1, 'input', 'en', 'keep transcript', 1),
+               (2, 'input', 'en', 'remove try transcript', 2),
+               (3, 'input', 'en', 'remove beta transcript', 3);
+      INSERT INTO attendees (session_id, viewer_id, name, joins)
+        VALUES (1, 'keep-viewer', 'Keep', 1),
+               (2, 'try-viewer', 'Remove', 1),
+               (3, 'beta-viewer', 'Remove', 1);
+      INSERT INTO polls (session_id, poll_id, question, options)
+        VALUES (1, 'keep-poll', 'Keep?', '["Yes","No"]'),
+               (2, 'try-poll', 'Remove?', '["Yes","No"]'),
+               (3, 'beta-poll', 'Remove?', '["Yes","No"]');
+      INSERT INTO poll_votes (session_id, poll_id, viewer_id, option_index)
+        VALUES (1, 'keep-poll', 'keep-viewer', 0),
+               (2, 'try-poll', 'try-viewer', 0),
+               (3, 'beta-poll', 'beta-viewer', 0);
+      INSERT INTO reaction_tallies (session_id, emoji, count)
+        VALUES (1, '👍', 1), (2, '👍', 2), (3, '👍', 3);
+      INSERT INTO beta_leads VALUES (1, 'historical@example.com');
+      INSERT INTO trial_rate_limits VALUES ('legacy', 'hash');
+      INSERT INTO trial_abuse_events VALUES (1, 'historical audit');
+    `);
+    openDb.close();
+    openDb = null;
+
+    const { completePendingSlideDeletion, initDb } = await import(path.join(ROOT, 'server/dist/db.js'));
+    const first = initDb(legacyPath);
+    openDb = first.database;
+
+    const remainingSessions = openDb
+      .prepare('SELECT id, slug, title FROM sessions ORDER BY id')
+      .all();
+    const childTables = ['transcripts', 'attendees', 'poll_votes', 'polls', 'reaction_tallies'];
+    const childRows = Object.fromEntries(
+      childTables.map((table) => [
+        table,
+        openDb.prepare(`SELECT COUNT(*) AS count, MIN(session_id) AS min_id, MAX(session_id) AS max_id FROM ${table}`).get(),
+      ])
+    );
+    check(
+      'migration removes legacy sessions/children and preserves normal rows',
+      JSON.stringify(remainingSessions) === JSON.stringify([
+        { id: 1, slug: 'normal-row', title: 'Normal session' },
+        { id: 4, slug: 'normal-shared', title: 'Normal shared deck' },
+      ]) &&
+        Object.values(childRows).every((row) => row.count === 1 && row.min_id === 1 && row.max_id === 1),
+      JSON.stringify({ remainingSessions, childRows })
+    );
+
+    const sessionColumns = openDb.prepare('PRAGMA table_info(sessions)').all().map((column) => column.name);
+    const remainingTables = new Set(
+      openDb.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((row) => row.name)
+    );
+    check(
+      'migration removes retired tables and session columns',
+      !sessionColumns.includes('is_trial') &&
+        !sessionColumns.includes('trial_type') &&
+        !remainingTables.has('beta_leads') &&
+        !remainingTables.has('trial_rate_limits') &&
+        !remainingTables.has('trial_abuse_events'),
+      JSON.stringify({ sessionColumns, remainingTables: [...remainingTables].sort() })
+    );
+    check(
+      'migration queues only unreferenced retired slide cleanup refs',
+      JSON.stringify(first.pendingSlideRefs) === JSON.stringify(['aaaaaaaaaaaa.pdf']),
+      JSON.stringify(first.pendingSlideRefs)
+    );
+
+    openDb.close();
+    openDb = null;
+    const compactedDbBytes = fs.readFileSync(legacyPath).toString('latin1');
+    check(
+      'migration compacts retired sensitive records out of SQLite',
+      !compactedDbBytes.includes('historical@example.com') &&
+        !compactedDbBytes.includes('historical audit') &&
+        (!fs.existsSync(`${legacyPath}-wal`) || fs.statSync(`${legacyPath}-wal`).size === 0),
+      'retired marker remained in the database or WAL'
+    );
+
+    const second = initDb(legacyPath);
+    openDb = second.database;
+    const secondSessions = openDb.prepare('SELECT id, slug FROM sessions ORDER BY id').all();
+    const secondChildCounts = childTables.map((table) =>
+      openDb.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count
+    );
+    const secondColumns = openDb.prepare('PRAGMA table_info(sessions)').all().map((column) => column.name);
+    check(
+      'legacy migration is idempotent and retains failed cleanup work for retry',
+      JSON.stringify(second.pendingSlideRefs) === JSON.stringify(['aaaaaaaaaaaa.pdf']) &&
+        JSON.stringify(secondSessions) === JSON.stringify([
+          { id: 1, slug: 'normal-row' },
+          { id: 4, slug: 'normal-shared' },
+        ]) &&
+        secondChildCounts.every((count) => count === 1) &&
+        !secondColumns.includes('is_trial') &&
+        !secondColumns.includes('trial_type'),
+      JSON.stringify({ refs: second.pendingSlideRefs, secondSessions, secondChildCounts, secondColumns })
+    );
+    completePendingSlideDeletion('aaaaaaaaaaaa.pdf');
+    check(
+      'completed slide cleanup is removed from the durable retry queue',
+      openDb.prepare('SELECT COUNT(*) AS count FROM pending_slide_deletions').get().count === 0
+    );
+  } finally {
+    openDb?.close();
+    fs.rmSync(legacyDir, { recursive: true, force: true });
+  }
+}
+
+// ---- Test 0b: R2 deletion is not complete until every public cache is purged.
+console.log('\n[0b] R2 PDF deletion and cache retirement');
+{
+  const { S3Client } = await import('@aws-sdk/client-s3');
+  const { createSlideStorage } = await import(path.join(ROOT, 'server/dist/storage.js'));
+  const originalSend = S3Client.prototype.send;
+  const originalFetch = globalThis.fetch;
+  const originalWarn = console.warn;
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fluent-r2-storage-'));
+  const sentCommands = [];
+  const purgeCalls = [];
+
+  try {
+    S3Client.prototype.send = async function send(command) {
+      sentCommands.push(command);
+      const body = command.input?.Body;
+      if (body && typeof body[Symbol.asyncIterator] === 'function') {
+        for await (const _chunk of body) {
+          // Consume the mocked upload stream before uploadPdf unlinks the file.
+        }
+      }
+      return {};
+    };
+    globalThis.fetch = async (url, options) => {
+      purgeCalls.push({ url: String(url), options });
+      return new Response(JSON.stringify({ success: true }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    };
+
+    const storage = createSlideStorage({
+      UPLOADS_DIR: tempDir,
+      R2_ACCOUNT_ID: 'test-account',
+      R2_ACCESS_KEY_ID: 'test-access-key',
+      R2_SECRET_ACCESS_KEY: 'test-secret-key',
+      R2_BUCKET: 'test-bucket',
+      R2_PUBLIC_BASE_URL: 'https://current-cdn.example.com',
+      R2_CACHE_PURGE_BASE_URLS: [
+        'https://current-cdn.example.com',
+        'https://old-cdn.example.com',
+      ],
+      R2_CACHE_PURGE_ZONE_ID: 'test-zone',
+      R2_CACHE_PURGE_API_TOKEN: 'test-purge-token',
+    });
+    const tmpPdf = path.join(tempDir, 'upload.pdf');
+    fs.writeFileSync(tmpPdf, MINI_PDF);
+    const ref = await storage.uploadPdf(tmpPdf, 'cccccccccccc.pdf');
+    const completed = await storage.removeMany([
+      ref,
+      'r2:slides/dddddddddddd.pdf',
+    ]);
+    const putCommand = sentCommands.find((command) => command.constructor.name === 'PutObjectCommand');
+    const purgePrefixes = purgeCalls
+      .flatMap((call) => JSON.parse(call.options.body).prefixes ?? [])
+      .sort();
+
+    check(
+      'new R2 PDFs prohibit shared/browser caching',
+      putCommand?.input?.CacheControl === 'private, no-store, max-age=0',
+      `(got ${putCommand?.input?.CacheControl ?? 'missing'})`
+    );
+    check(
+      'R2 cleanup purges all current/historical cache-key variants before completion',
+      completed.size === 2 &&
+        purgeCalls.length === 1 &&
+        purgeCalls.every(
+          (call) =>
+            call.url.endsWith('/zones/test-zone/purge_cache') &&
+            call.options.headers.Authorization === 'Bearer test-purge-token'
+        ) &&
+        JSON.stringify(purgePrefixes) ===
+          JSON.stringify([
+            'current-cdn.example.com/slides/cccccccccccc.pdf',
+            'current-cdn.example.com/slides/dddddddddddd.pdf',
+            'old-cdn.example.com/slides/cccccccccccc.pdf',
+            'old-cdn.example.com/slides/dddddddddddd.pdf',
+          ]),
+      JSON.stringify({ completed: [...completed], purgePrefixes })
+    );
+
+    console.warn = () => {};
+    purgeCalls.length = 0;
+    let purgeAttempt = 0;
+    globalThis.fetch = async (url, options) => {
+      purgeCalls.push({ url: String(url), options });
+      purgeAttempt += 1;
+      return purgeAttempt === 1
+        ? new Response(JSON.stringify({ success: true }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        : new Response(JSON.stringify({ success: false, errors: [{ code: 1015, message: 'rate limited' }] }), {
+            status: 429,
+            headers: { 'Content-Type': 'application/json', 'Retry-After': '60' },
+          });
+    };
+    const bulkRefs = Array.from(
+      { length: 51 },
+      (_, index) => `r2:slides/bulk-${String(index).padStart(2, '0')}.pdf`
+    );
+    const bulkCompleted = await storage.removeMany(bulkRefs);
+    check(
+      'batched 429 preserves successful progress and retries only the failed group',
+      bulkCompleted.size === 50 &&
+        bulkRefs.slice(0, 50).every((ref) => bulkCompleted.has(ref)) &&
+        !bulkCompleted.has(bulkRefs[50]) &&
+        JSON.stringify(purgeCalls.map((call) => JSON.parse(call.options.body).prefixes.length)) ===
+          JSON.stringify([100, 2]),
+      JSON.stringify({ completed: [...bulkCompleted], batches: purgeCalls.length })
+    );
+  } finally {
+    S3Client.prototype.send = originalSend;
+    globalThis.fetch = originalFetch;
+    console.warn = originalWarn;
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
 // ---- Test 1: boots without ADMIN_SECRET, falling back to "admin" + warning
 console.log('\n[1] Boot with no ADMIN_SECRET (defaults to "admin")');
 {
@@ -403,19 +724,27 @@ console.log('\n[5] Numeric environment validation');
   const code = await new Promise((r) => proc.on('exit', r));
   check('boot fails with invalid PORT', code !== 0 && stderr.includes('PORT'), `(code ${code})`);
 }
-
 {
-  const badTtlEnv = { ...env, TRIAL_TTL_MS: '0' };
+  const unsafePublicR2Env = {
+    ...env,
+    R2_PUBLIC_BASE_URL: 'https://cdn.example.com',
+    R2_CACHE_PURGE_ZONE_ID: '',
+    R2_CACHE_PURGE_API_TOKEN: '',
+  };
   const { tmpdir } = await import('node:os');
   const proc = spawn('node', [path.join(ROOT, 'server/dist/index.js')], {
     cwd: tmpdir(),
-    env: badTtlEnv,
+    env: unsafePublicR2Env,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let stderr = '';
   proc.stderr.on('data', (d) => (stderr += d));
   const code = await new Promise((r) => proc.on('exit', r));
-  check('boot fails with invalid TRIAL_TTL_MS', code !== 0 && stderr.includes('TRIAL_TTL_MS'), `(code ${code})`);
+  check(
+    'public R2 delivery requires cache-purge credentials',
+    code !== 0 && stderr.includes('R2_CACHE_PURGE'),
+    `(code ${code})`
+  );
 }
 
 // ---- Test 6: secrets absent from client bundle (criterion #6)
@@ -428,14 +757,12 @@ console.log('\n[6] No secrets in client bundle');
     'UPLOADS_DIR',
     'PORT',
     'HOST',
-    'TRIAL_TTL_MS',
     'PUBLIC_ORIGIN',
     'TRUST_PROXY',
     'MAX_VIEWERS_PER_SESSION',
     'PUBLIC_GET_MAX',
     'SENTRY_DSN',
     'ENABLE_TEST_HOOKS',
-    'VALIDATE_TRIAL_GEMINI_KEYS',
     'AUDIO_SYNC_METADATA',
     'AUDIO_SUBSCRIPTION_ACTIVE',
     'CF_REALTIME_APP_ID',
@@ -447,6 +774,9 @@ console.log('\n[6] No secrets in client bundle');
     'R2_SECRET_ACCESS_KEY',
     'R2_BUCKET',
     'R2_PUBLIC_BASE_URL',
+    'R2_CACHE_PURGE_BASE_URLS',
+    'R2_CACHE_PURGE_ZONE_ID',
+    'R2_CACHE_PURGE_API_TOKEN',
     'ASSET_CDN_BASE_URL',
   ];
   const fakeServerSecrets = [SECRET, env.GEMINI_API_KEY, 'fake-realtime-secret', 'app-test'];
@@ -497,6 +827,16 @@ if (!(await waitForHealth())) {
     csp
   );
   check('healthz verifies runtime dependencies', health.ok && healthBody?.ok === true);
+
+  const [retiredTry, retiredHostedCreation] = await Promise.all([
+    fetch(`${BASE}/api/try`, { method: 'POST' }),
+    fetch(`${BASE}/api/beta/trial`, { method: 'POST' }),
+  ]);
+  check(
+    'retired public session-creation endpoints are unavailable',
+    retiredTry.status === 404 && retiredHostedCreation.status === 404,
+    `(got ${retiredTry.status} and ${retiredHostedCreation.status})`
+  );
 
   // wrong key → 401
   const res = await fetch(`${BASE}/api/sessions`, {
@@ -585,7 +925,12 @@ let slug = '';
     JSON.stringify(inactiveSfuBody)
   );
   const pdf = await fetch(`${BASE}${info.slideUrl}`);
-  check('uploaded PDF is served', pdf.ok && (await pdf.text()).startsWith('%PDF'));
+  check(
+    'uploaded PDF is served without cache retention',
+    pdf.ok &&
+      pdf.headers.get('cache-control')?.includes('no-store') &&
+      (await pdf.text()).startsWith('%PDF')
+  );
   const langs = await (await fetch(`${BASE}/api/languages`)).json();
   check('language table has 70+ entries', Array.isArray(langs) && langs.length >= 70, `(got ${langs.length})`);
 
@@ -686,237 +1031,6 @@ let slug = '';
     : '';
   check('invalid slideCount is rejected and upload is cleaned up', badSlideCountRes.status === 400 && uploadsAfterBadSlideCount === uploadsBeforeBadSlideCount);
 
-  const uploadsBeforeBadTrial = fs.existsSync(env.UPLOADS_DIR)
-    ? fs.readdirSync(env.UPLOADS_DIR).sort().join('|')
-    : '';
-  const badTrial = new FormData();
-  badTrial.set('geminiApiKey', 'short');
-  badTrial.set('title', 'Bad Trial');
-  badTrial.set('targetLang', 'es');
-  badTrial.set('slideType', 'pdf');
-  badTrial.set('file', new File([MINI_PDF], 'trial.pdf', { type: 'application/pdf' }));
-  const badTrialRes = await fetch(`${BASE}/api/try`, { method: 'POST', body: badTrial });
-  const uploadsAfterBadTrial = fs.existsSync(env.UPLOADS_DIR)
-    ? fs.readdirSync(env.UPLOADS_DIR).sort().join('|')
-    : '';
-  check('invalid trial upload is cleaned up', badTrialRes.status === 400 && uploadsAfterBadTrial === uploadsBeforeBadTrial);
-
-  const badTrialAuditDb = new Database(env.DATABASE_PATH);
-  const badTrialAudit = badTrialAuditDb
-    .prepare(`SELECT * FROM trial_abuse_events WHERE flow = 'try' AND reason = 'invalid_key_format' ORDER BY id DESC LIMIT 1`)
-    .get();
-  badTrialAuditDb.close();
-  check('invalid trial key format is audited durably', !!badTrialAudit && badTrialAudit.allowed === 0);
-
-  const activeTrial = new FormData();
-  activeTrial.set('geminiApiKey', 'fake-trial-key');
-  activeTrial.set('title', 'Active Trial');
-  activeTrial.set('targetLang', 'es');
-  activeTrial.set('slideType', 'pdf');
-  activeTrial.set('file', new File([MINI_PDF], 'active-trial.pdf', { type: 'application/pdf' }));
-  const activeTrialRes = await fetch(`${BASE}/api/try`, { method: 'POST', body: activeTrial });
-  const activeTrialBody = await activeTrialRes.json();
-  const activeTrialHost = await wsOpen(activeTrialBody.slug, { role: 'host', auth: activeTrialBody.hostToken });
-  const activeTrialAnalytics = await fetch(`${BASE}/api/sessions/${activeTrialBody.slug}/analytics`, {
-    headers: { Authorization: `Bearer ${activeTrialBody.hostToken}` },
-  });
-  await new Promise((r) => setTimeout(r, 1100));
-  const activeTrialStillThere = await fetch(`${BASE}/api/sessions/${activeTrialBody.slug}`);
-  check('active trial is not deleted mid-session at TTL', activeTrialRes.ok && activeTrialHost.messages.some((m) => m.type === 'snapshot') && activeTrialStillThere.ok);
-  check('trial host token can read session analytics', activeTrialAnalytics.ok, `(status ${activeTrialAnalytics.status})`);
-  activeTrialHost.ws.close();
-  await new Promise((r) => setTimeout(r, 900));
-  const activeTrialAfterClose = await fetch(`${BASE}/api/sessions/${activeTrialBody.slug}`);
-  check('active trial expires after sockets close', activeTrialAfterClose.status === 404, `(got ${activeTrialAfterClose.status})`);
-
-  const trial = new FormData();
-  trial.set('geminiApiKey', 'fake-trial-key');
-  trial.set('title', 'Expiring Trial');
-  trial.set('targetLang', 'es');
-  trial.set('slideType', 'pdf');
-  trial.set('file', new File([MINI_PDF], 'trial.pdf', { type: 'application/pdf' }));
-  const trialRes = await fetch(`${BASE}/api/try`, { method: 'POST', body: trial });
-  const trialBody = await trialRes.json();
-  const trialInfo = await (await fetch(`${BASE}/api/sessions/${trialBody.slug}`)).json();
-  const trialPdfBefore = await fetch(`${BASE}${trialInfo.slideUrl}`);
-  await new Promise((r) => setTimeout(r, 1100));
-  const trialAfter = await fetch(`${BASE}/api/sessions/${trialBody.slug}`);
-  const trialPdfAfter = await fetch(`${BASE}${trialInfo.slideUrl}`);
-  check('trial expires and removes its uploaded PDF', trialRes.ok && trialPdfBefore.ok && trialAfter.status === 404 && trialPdfAfter.status === 404);
-  check(
-    'own-key trial reports 15 minutes and a 10 viewer cap',
-    trialInfo.trialRuntimeMs === 900_000 && trialInfo.trialMaxViewers === 10,
-    JSON.stringify(trialInfo)
-  );
-
-  const tryRateStatuses = [];
-  // The limiter uses wall-clock-aligned one-minute windows. A three-request
-  // assertion can straddle a boundary and miss the requests made just above.
-  // Eleven immediate attempts guarantee that at least six land in the same
-  // window, even when the sequence crosses one boundary.
-  for (let i = 0; i < 11 && !tryRateStatuses.includes(429); i += 1) {
-    const res = await fetch(`${BASE}/api/try`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        geminiApiKey: 'fake-trial-key',
-        title: `Rate Trial ${i}`,
-        targetLang: 'es',
-        slideType: 'html',
-        slideUrl: `https://example.com/rate-trial-${i}.html`,
-      }),
-    });
-    tryRateStatuses.push(res.status);
-  }
-  check(
-    'own-key trial creation is durably rate-limited by IP',
-    tryRateStatuses.at(-1) === 429 && tryRateStatuses.slice(0, -1).every((status) => status === 200),
-    JSON.stringify(tryRateStatuses)
-  );
-  const tryRateAuditDb = new Database(env.DATABASE_PATH);
-  const tryRateAudit = tryRateAuditDb
-    .prepare(`SELECT * FROM trial_abuse_events WHERE flow = 'try' AND reason = 'rate_limited_ip' ORDER BY id DESC LIMIT 1`)
-    .get();
-  tryRateAuditDb.close();
-  check('own-key trial rate-limit denial is audited durably', !!tryRateAudit && tryRateAudit.allowed === 0);
-
-  const betaEmailLocal = `beta${Date.now()}`;
-  const beta = new FormData();
-  beta.set('fullName', 'Beta Lead');
-  beta.set('email', `${betaEmailLocal}+trial@acme.co`);
-  beta.set('company', 'Acme Co');
-  beta.set('budget', '$50-$100/hour');
-  beta.set('title', 'Hosted Beta Trial');
-  beta.set('targetLang', 'es');
-  beta.set('presentationMode', 'remote');
-  beta.set('slideType', 'html');
-  beta.set('slideUrl', 'https://example.com/beta-deck.html');
-  const betaRes = await fetch(`${BASE}/api/beta/trial`, { method: 'POST', body: beta });
-  const betaBody = await betaRes.json();
-  const betaInfo = await (await fetch(`${BASE}/api/sessions/${betaBody.slug}`)).json();
-  const betaAnalytics = await fetch(`${BASE}/api/sessions/${betaBody.slug}/analytics`, {
-    headers: { Authorization: `Bearer ${betaBody.hostToken}` },
-  });
-  check(
-    'hosted beta creates a one-keyless trial session',
-    betaRes.ok &&
-      betaBody.hostToken &&
-      betaInfo.trialKind === 'beta' &&
-      betaInfo.trialRuntimeMs === 120_000 &&
-      betaInfo.trialMaxViewers === 10 &&
-      betaInfo.slideType === 'html' &&
-      !JSON.stringify(betaInfo).includes(env.GEMINI_API_KEY),
-    JSON.stringify({ status: betaRes.status, body: betaBody, info: betaInfo })
-  );
-  check('hosted beta host token can read analytics', betaAnalytics.ok, `(status ${betaAnalytics.status})`);
-
-  const betaExpediteRes = await fetch(`${BASE}/api/beta/trial/${betaBody.slug}/expedite`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${betaBody.hostToken}` },
-  });
-  const betaExpedite = await betaExpediteRes.json();
-  const betaFeedbackRes = await fetch(`${BASE}/api/beta/trial/${betaBody.slug}/feedback`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${betaBody.hostToken}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ rating: 5, feedback: 'Smoke feedback' }),
-  });
-  const betaFeedback = await betaFeedbackRes.json();
-  check(
-    'hosted beta records expedite request and feedback with host token',
-    betaExpediteRes.ok &&
-      betaExpedite.expediteRequested === true &&
-      betaFeedbackRes.ok &&
-      betaFeedback.rating === 5 &&
-      betaFeedback.feedback === 'Smoke feedback',
-    JSON.stringify({ betaExpedite, betaFeedback })
-  );
-
-  const betaViewers = [];
-  const betaHost = await wsOpen(betaBody.slug, { role: 'host', auth: betaBody.hostToken });
-  for (let i = 0; i < 10; i += 1) {
-    betaViewers.push(await wsOpen(betaBody.slug, { role: 'viewer', viewerId: `beta-viewer-${i}` }));
-  }
-  const betaViewerOverCap = await wsOpen(betaBody.slug, { role: 'viewer', viewerId: 'beta-viewer-over-cap' });
-  check(
-    'hosted beta allows 10 viewers and rejects the 11th',
-    betaViewers.every((v) => v.messages.some((m) => m.type === 'snapshot')) &&
-      betaViewerOverCap.closeCode() === 4409,
-    `(close ${betaViewerOverCap.closeCode()})`
-  );
-  betaHost.ws.close();
-  betaViewers.forEach((v) => v.ws.close());
-  betaViewerOverCap.ws.close();
-  await new Promise((r) => setTimeout(r, 300));
-
-  const dupBeta = new FormData();
-  dupBeta.set('fullName', 'Beta Lead Again');
-  dupBeta.set('email', `${betaEmailLocal}@acme.co`);
-  dupBeta.set('company', 'Acme Co');
-  dupBeta.set('budget', '$50-$100/hour');
-  dupBeta.set('title', 'Duplicate Hosted Beta Trial');
-  dupBeta.set('targetLang', 'es');
-  dupBeta.set('slideType', 'html');
-  dupBeta.set('slideUrl', 'https://example.com/duplicate-beta-deck.html');
-  const dupBetaRes = await fetch(`${BASE}/api/beta/trial`, { method: 'POST', body: dupBeta });
-  check('duplicate beta email is rejected', dupBetaRes.status === 409, `(got ${dupBetaRes.status})`);
-
-  const fakeBeta = new FormData();
-  fakeBeta.set('fullName', 'Fake Lead');
-  fakeBeta.set('email', 'demo@mailinator.com');
-  fakeBeta.set('company', 'Fake Co');
-  fakeBeta.set('budget', 'Not sure yet');
-  fakeBeta.set('title', 'Fake Hosted Beta Trial');
-  fakeBeta.set('targetLang', 'es');
-  fakeBeta.set('slideType', 'html');
-  fakeBeta.set('slideUrl', 'https://example.com/fake-beta-deck.html');
-  const fakeBetaRes = await fetch(`${BASE}/api/beta/trial`, { method: 'POST', body: fakeBeta });
-  check('fake/disposable beta email is rejected', fakeBetaRes.status === 400, `(got ${fakeBetaRes.status})`);
-
-  const betaAuditDb = new Database(env.DATABASE_PATH);
-  const betaSuccessAudit = betaAuditDb
-    .prepare(`SELECT * FROM trial_abuse_events WHERE flow = 'beta' AND reason = 'created' AND session_slug = ?`)
-    .get(betaBody.slug);
-  const betaInvalidAudit = betaAuditDb
-    .prepare(`SELECT * FROM trial_abuse_events WHERE flow = 'beta' AND reason = 'invalid_lead' ORDER BY id DESC LIMIT 1`)
-    .get();
-  const betaRateRows = betaAuditDb
-    .prepare(`SELECT * FROM trial_rate_limits WHERE scope = 'trial_create:beta:ip'`)
-    .all();
-  betaAuditDb.close();
-  check('beta trial success and invalid lead attempts are audited durably', !!betaSuccessAudit && betaSuccessAudit.allowed === 1 && !!betaInvalidAudit && betaInvalidAudit.allowed === 0);
-  check('beta trial creation rate limit state is durable', betaRateRows.length > 0);
-
-  const bigBetaPdf = new FormData();
-  bigBetaPdf.set('fullName', 'Big Pdf Lead');
-  bigBetaPdf.set('email', `bigpdf${Date.now()}@acme.co`);
-  bigBetaPdf.set('company', 'Acme Co');
-  bigBetaPdf.set('budget', '$100-$150/hour');
-  bigBetaPdf.set('title', 'Big PDF Hosted Beta Trial');
-  bigBetaPdf.set('targetLang', 'es');
-  bigBetaPdf.set('slideType', 'pdf');
-  bigBetaPdf.set('file', new File([new Uint8Array(5 * 1024 * 1024 + 1)], 'too-big.pdf', { type: 'application/pdf' }));
-  const bigBetaPdfRes = await fetch(`${BASE}/api/beta/trial`, { method: 'POST', body: bigBetaPdf });
-  check('hosted beta rejects PDF uploads over 5 MB', bigBetaPdfRes.status === 400, `(got ${bigBetaPdfRes.status})`);
-
-  const betaLeadsRes = await fetch(`${BASE}/api/beta/leads`, {
-    headers: { Authorization: `Bearer ${SECRET}` },
-  });
-  const betaLeads = await betaLeadsRes.json();
-  const betaLead = betaLeads.find((lead) => lead.sessionSlug === betaBody.slug);
-  check(
-    'admin beta leads include lead details and duplicate counters',
-    betaLeadsRes.ok &&
-      betaLead?.email === `${betaEmailLocal}+trial@acme.co` &&
-      betaLead?.fullName === 'Beta Lead' &&
-      betaLead?.company === 'Acme Co' &&
-      betaLead?.budget === '$50-$100/hour' &&
-      betaLead?.duplicateAttempts === 1 &&
-      betaLead?.expediteRequested === true &&
-      betaLead?.feedbackRating === 5 &&
-      betaLead?.feedback === 'Smoke feedback' &&
-      typeof betaLead?.lastDuplicateAt === 'string',
-    JSON.stringify(betaLead)
-  );
 }
 
 // ---- Test 9: WS auth + read-only viewers (criterion #7)

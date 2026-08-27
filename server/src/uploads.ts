@@ -12,7 +12,14 @@ export function generatedPdfPath(uploadsDir: string, ref: string): string {
   return path.join(uploadsDir, ref);
 }
 
-export async function removeUploadedPdf(uploadsDir: string, ref: string): Promise<void> {
-  if (!isGeneratedPdfUpload(ref)) return;
-  await fsp.unlink(generatedPdfPath(uploadsDir, ref)).catch(() => {});
+export async function removeUploadedPdf(uploadsDir: string, ref: string): Promise<boolean> {
+  if (!isGeneratedPdfUpload(ref)) return true;
+  try {
+    await fsp.unlink(generatedPdfPath(uploadsDir, ref));
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return true;
+    console.warn(`[uploads] failed to remove uploaded PDF ${ref}:`, err);
+    return false;
+  }
 }

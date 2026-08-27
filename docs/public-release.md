@@ -34,10 +34,9 @@ not silently diverge.
 | Environment credentials | `.env`, `.env.*`, provider dashboards | Never copy or commit; rotate after suspected exposure. |
 | SQLite and journals | `data/`, `server/data/`, `*.db`, `*.db-wal`, `*.db-shm` | Contains session metadata and may contain every record described below. Exclude from source exports. |
 | Attendee profiles | `attendees` table and SQLite backups | Viewer ID, optional name and company, join count, total watch time, and first-joined/last-seen timestamps. |
-| Beta leads | `beta_leads` table and SQLite backups | Supplied and normalized email, full name, company, budget range, session slug, duplicate attempts, expedite requests, feedback, and timestamps. |
-| Trial-abuse audits | `trial_rate_limits`, `trial_abuse_events`, logs, and SQLite backups | Hashed IP/rate-limit keys, short Gemini-key hash prefixes, emails, session slugs, outcomes, reasons, status/detail, and timestamps. Hashes remain sensitive pseudonymous data. |
 | Transcripts | `transcripts` table, exports, logs, and SQLite backups | Source and translated speech text, language, timing, slide position, finalization state, and session association. |
 | Uploaded decks | `uploads/`, `data/**/uploads/`, backups, R2 objects | Treat as user content; delete or retain under the deployment's data policy. |
+| Historical retired-flow data | Backups made by older releases, old database exports, logs, and upload/R2 copies | May include lead contact details, abuse-prevention hashes and audit rows, retired trial sessions, transcripts, attendee records, and decks. The current schema no longer collects these lead/audit records, but historical copies remain sensitive. |
 | Evaluation media | `evaluation/corpus/`, results, reviewer packets, SFU captures | Use synthetic or explicitly licensed fixtures only in the public repository. |
 | Generated builds | `client/dist/`, `server/dist/` | Rebuild from public source. Client bundles can contain `VITE_*` deployment values. |
 | Logs and diagnostics | service logs, browser traces, screenshots, crash reports | Remove tokens, session slugs, names, emails, transcripts, and request bodies. |
@@ -66,7 +65,7 @@ Start from a clean, approved commit in the private repository.
 
    ```bash
    git grep -n -I -E '(/Users/|/home/|[[:alnum:]._%+-]+@[[:alnum:].-]+\.[[:alpha:]]{2,})'
-   git grep -n -I -E '(GEMINI_API_KEY|ADMIN_SECRET|CF_REALTIME_APP_SECRET|R2_SECRET_ACCESS_KEY)='
+   git grep -n -I -E '(GEMINI_API_KEY|ADMIN_SECRET|CF_REALTIME_APP_SECRET|R2_SECRET_ACCESS_KEY|R2_CACHE_PURGE_API_TOKEN)='
    git grep -n -I -E 'https?://'
    git ls-files | rg '(^|/)(data|dist|uploads|backups)/|\.db($|-)|\.env($|\.)'
    ```
@@ -168,8 +167,8 @@ an auditable release history, while the private repository remains canonical.
 Repository cleanup does not remove data from Render, R2, logs, backups, or
 analytics providers. Define and enforce a deployment policy for:
 
-- how long sessions, transcripts, attendee profiles, beta leads, trial-abuse
-  hashes/audits, poll records, analytics, and uploaded decks are kept;
+- how long sessions, transcripts, attendee profiles, poll records, analytics,
+  and uploaded decks are kept;
 - who can access SQLite, uploaded decks, backups, and provider dashboards;
 - when uploaded decks and R2 objects are deleted;
 - how users request access or deletion;
@@ -177,8 +176,10 @@ analytics providers. Define and enforce a deployment policy for:
 - how incident logs are retained without keeping unnecessary content.
 
 Backups are independent copies: deleting a row or upload from the live service
-does not remove it from an older SQLite/upload backup. Operators must disclose
-the deployed collection to users, choose an appropriate legal basis or consent
+does not remove it from an older SQLite/upload backup. This includes backups
+from releases that still contained retired trial-flow lead, abuse-audit,
+session, attendee, transcript, and deck data. Operators must disclose the
+deployed collection to users, choose an appropriate legal basis or consent
 flow, minimize fields, restrict operator access, set primary and backup expiry,
 honor applicable access/deletion requests, and assess provider and
 cross-border-transfer obligations. Hashing an IP, viewer, or key-derived value

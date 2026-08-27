@@ -5,7 +5,6 @@ import { MessageSquare, X, BarChart3, ChevronLeft, ChevronRight } from 'lucide-r
 import { fetchSession, type SessionInfo } from '../lib/api';
 import { SessionSocket } from '../lib/ws';
 import { getAdminKey } from '../lib/adminKey';
-import { getTrialHostToken } from '../lib/trial';
 import { useTranscriptLines } from '../lib/useTranscripts';
 import { useCaptionPip } from '../lib/captionPip';
 import { usePoll } from '../lib/usePoll';
@@ -40,9 +39,9 @@ export default function Present() {
   const sockRef = useRef<SessionSocket | null>(null);
 
   const viewerUrl = `${location.origin}/${slug}`;
-  // The presenter's token (trial host token, else stored admin key) lets this
-  // stage drive slides. Absent it, the page is a read-only display.
-  const auth = getTrialHostToken(slug) ?? getAdminKey() ?? '';
+  // The stored admin key lets this stage drive slides. Absent it, the page is a
+  // read-only display.
+  const auth = getAdminKey() ?? '';
   const canPresent = !!auth;
 
   useEffect(() => {

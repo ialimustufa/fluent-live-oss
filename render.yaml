@@ -52,5 +52,11 @@ services:
         sync: false
       - key: R2_PUBLIC_BASE_URL
         sync: false
+      - key: R2_CACHE_PURGE_BASE_URLS
+        sync: false
+      - key: R2_CACHE_PURGE_ZONE_ID
+        sync: false
+      - key: R2_CACHE_PURGE_API_TOKEN
+        sync: false
       - key: ASSET_CDN_BASE_URL
         sync: false

@@ -4,8 +4,9 @@ import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { initDb } from './db.js';
+import { completePendingSlideDeletion, initDb } from './db.js';
 import { loadEnv } from './env.js';
+import { createSlideStorage } from './storage.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -53,7 +54,16 @@ async function main(): Promise<void> {
   await assertClientBuild();
   await assertWritableDir(path.dirname(env.DATABASE_PATH), 'database directory');
   await assertWritableDir(env.UPLOADS_DIR, 'uploads directory');
-  initDb(env.DATABASE_PATH);
+  const { pendingSlideRefs } = initDb(env.DATABASE_PATH);
+  const slideStorage = createSlideStorage(env);
+  const completedSlideDeletions = await slideStorage.removeMany(pendingSlideRefs);
+  for (const slideRef of completedSlideDeletions) completePendingSlideDeletion(slideRef);
+  const failedSlideDeletions = pendingSlideRefs.length - completedSlideDeletions.size;
+  if (failedSlideDeletions > 0) {
+    throw new Error(
+      `Failed to remove ${failedSlideDeletions} pending slide object(s); cleanup remains queued.`
+    );
+  }
   await assertDbBackup(env.DATABASE_PATH);
   if (process.env.NODE_ENV === 'production' && !env.PUBLIC_ORIGIN) {
     console.warn('warning PUBLIC_ORIGIN is not set; same-host HTML decks are still rejected from request Host.');

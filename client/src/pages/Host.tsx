@@ -3,46 +3,19 @@ import { createPortal } from 'react-dom';
 import { useParams } from 'react-router-dom';
 import {
   Play, Pause, Square, RotateCw, ChevronLeft, ChevronRight, Users, Circle,
-  ExternalLink, MonitorPlay, PictureInPicture2, X, Check, Plus, Volume2, Headphones, Smartphone,
+  MonitorPlay, PictureInPicture2, X, Check, Plus, Volume2, Headphones, Smartphone,
   Mic, MicOff,
 } from 'lucide-react';
 
 type Routing = 'room' | 'headphones' | 'viewers';
 type HostTab = 'setup' | 'polls' | 'audience';
-type TourTarget =
-  | 'startStatus'
-  | 'slideNav'
-  | 'microphone'
-  | 'routing'
-  | 'advancedAudio'
-  | 'audienceLink'
-  | 'polls'
-  | 'analytics';
-
-type TourStep = {
-  target: TourTarget;
-  tab: HostTab;
-  title: string;
-  body: string;
-};
-
-type TourRect = {
-  top: number;
-  left: number;
-  width: number;
-  height: number;
-  bottom: number;
-};
 import {
   fetchSession,
   fetchAnalytics,
-  requestBetaTrialExpedite,
-  submitBetaTrialFeedback,
   type SessionInfo,
   type Analytics,
 } from '../lib/api';
 import { getAdminKey } from '../lib/adminKey';
-import { getTrialHostToken } from '../lib/trial';
 import { SessionSocket } from '../lib/ws';
 import { MicCapture, listAudioDevices, DSP_OFF, type DspConfig } from '../lib/audio-capture';
 import { TranslatedAudioPlayer } from '../lib/audio-playback';
@@ -68,74 +41,11 @@ function fmtDur(ms: number): string {
 }
 
 const ANALYTICS_REFRESH_MS = 10 * 60 * 1000;
-const BETA_ANALYTICS_REFRESH_MS = 2_000;
 const EMPTY_POLL_OPTIONS = ['', ''];
 const EMPTY_POLL_CORRECT = [false, false];
-const TRIAL_SAMPLE_POLL = {
-  question: 'How clear is the live translation so far?',
-  options: ['Very clear', 'Mostly clear', 'Needs work'],
-  correct: [false, false, false],
-};
-const BETA_TOUR_STORAGE_PREFIX = 'fluent.betaSetupTour.';
-const BETA_SETUP_TOUR_STEPS: TourStep[] = [
-  {
-    target: 'startStatus',
-    tab: 'setup',
-    title: 'Start and status',
-    body: 'This area shows whether the session is created, live, paused, or offline. Start is available right away, even if you skip this tour.',
-  },
-  {
-    target: 'slideNav',
-    tab: 'setup',
-    title: 'Slide controls',
-    body: 'Use these arrows to move the audience through your deck. Viewers stay synced to the slide you choose here.',
-  },
-  {
-    target: 'microphone',
-    tab: 'setup',
-    title: 'Microphone check',
-    body: 'Pick the presenter microphone and watch the level meter. If the meter moves while you speak, the translator has audio to work with.',
-  },
-  {
-    target: 'routing',
-    tab: 'setup',
-    title: 'Translated audio routing',
-    body: 'Choose where translated audio plays: room speakers, your headphones, or only on viewer phones.',
-  },
-  {
-    target: 'advancedAudio',
-    tab: 'setup',
-    title: 'Advanced audio',
-    body: 'Use this only when you need a specific speaker or HDMI output, or when speaker audio is feeding back into the microphone.',
-  },
-  {
-    target: 'audienceLink',
-    tab: 'setup',
-    title: 'Audience link',
-    body: 'Share this QR code or link before starting. For beta trials, join from your phone once so Analytics has a live viewer to track.',
-  },
-  {
-    target: 'polls',
-    tab: 'polls',
-    title: 'Live polls',
-    body: 'Create a quick poll or quiz during the talk. The beta trial includes a sample question you can edit or launch.',
-  },
-  {
-    target: 'analytics',
-    tab: 'audience',
-    title: 'Analytics',
-    body: 'Watch live attendance, joined viewers, peak count, and average watch time. Refresh is available when you need an immediate update.',
-  },
-];
 
 function fmtTime(ms: number): string {
   return new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-}
-
-function sqliteUtcMs(s: string | null | undefined): number | null {
-  if (!s) return null;
-  const ms = Date.parse(s.replace(' ', 'T') + 'Z');
-  return Number.isNaN(ms) ? null : ms;
 }
 
 function Stat({ label, value }: { label: string; value: string | number }) {
@@ -143,344 +53,6 @@ function Stat({ label, value }: { label: string; value: string | number }) {
     <div className="rounded-xl bg-[var(--surface-2)] px-3 py-2 ring-1 ring-inset ring-[var(--border)]">
       <div className="text-lg font-semibold text-[var(--fg)]">{value}</div>
       <div className="text-[11px] uppercase tracking-wide text-[var(--faint)]">{label}</div>
-    </div>
-  );
-}
-
-function betaTourStorageKey(slug: string): string {
-  return BETA_TOUR_STORAGE_PREFIX + slug;
-}
-
-function isBetaTourDismissed(slug: string): boolean {
-  try {
-    return sessionStorage.getItem(betaTourStorageKey(slug)) === 'dismissed';
-  } catch {
-    return false;
-  }
-}
-
-function dismissBetaTour(slug: string): void {
-  try {
-    sessionStorage.setItem(betaTourStorageKey(slug), 'dismissed');
-  } catch {
-    /* storage unavailable */
-  }
-}
-
-function clamp(n: number, min: number, max: number): number {
-  return Math.min(Math.max(n, min), Math.max(min, max));
-}
-
-function GuidedSetupTour({
-  steps,
-  stepIndex,
-  layoutKey,
-  getTarget,
-  onStepChange,
-  onDismiss,
-}: {
-  steps: TourStep[];
-  stepIndex: number;
-  layoutKey: string;
-  getTarget: (target: TourTarget) => HTMLElement | null;
-  onStepChange: (index: number) => void;
-  onDismiss: () => void;
-}) {
-  const step = steps[stepIndex];
-  const [rect, setRect] = useState<TourRect | null>(null);
-
-  const measure = useCallback(() => {
-    const target = getTarget(step.target);
-    if (!target) {
-      setRect(null);
-      return;
-    }
-    const bounds = target.getBoundingClientRect();
-    if (bounds.width <= 0 || bounds.height <= 0) {
-      setRect(null);
-      return;
-    }
-    const pad = 8;
-    const left = clamp(bounds.left - pad, 8, window.innerWidth - 16);
-    const top = clamp(bounds.top - pad, 8, window.innerHeight - 16);
-    const right = clamp(bounds.right + pad, 16, window.innerWidth - 8);
-    const bottom = clamp(bounds.bottom + pad, 16, window.innerHeight - 8);
-    setRect({ left, top, width: Math.max(1, right - left), height: Math.max(1, bottom - top), bottom });
-  }, [getTarget, step.target]);
-
-  useEffect(() => {
-    const target = getTarget(step.target);
-    if (target) target.scrollIntoView({ block: 'center', inline: 'nearest' });
-
-    const timers = [
-      window.setTimeout(measure, 0),
-      window.setTimeout(measure, 90),
-      window.setTimeout(measure, 180),
-    ];
-    const onUpdate = () => measure();
-    window.addEventListener('resize', onUpdate);
-    window.addEventListener('scroll', onUpdate, true);
-    return () => {
-      timers.forEach(window.clearTimeout);
-      window.removeEventListener('resize', onUpdate);
-      window.removeEventListener('scroll', onUpdate, true);
-    };
-  }, [getTarget, layoutKey, measure, step.target]);
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onDismiss();
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onDismiss]);
-
-  if (typeof document === 'undefined') return null;
-
-  const cardWidth = Math.max(240, Math.min(360, window.innerWidth - 32));
-  const estimatedCardHeight = 230;
-  const cardLeft = rect
-    ? clamp(rect.left + rect.width / 2 - cardWidth / 2, 16, window.innerWidth - cardWidth - 16)
-    : clamp(window.innerWidth / 2 - cardWidth / 2, 16, window.innerWidth - cardWidth - 16);
-  const cardTop = rect
-    ? rect.bottom + 14 + estimatedCardHeight <= window.innerHeight
-      ? rect.top + rect.height + 14
-      : rect.top - estimatedCardHeight - 14 >= 16
-        ? rect.top - estimatedCardHeight - 14
-        : 16
-    : Math.max(16, Math.round(window.innerHeight / 2 - estimatedCardHeight / 2));
-  const isLast = stepIndex === steps.length - 1;
-
-  return createPortal(
-    <div
-      className="fixed inset-0 z-[80] text-[var(--fg)]"
-      role="dialog"
-      aria-modal="true"
-      aria-label="Beta setup tour"
-    >
-      {!rect && <div className="absolute inset-0 bg-black/65" />}
-      {rect && (
-        <div
-          className="pointer-events-none fixed rounded-[var(--r-lg)] ring-2 ring-[var(--cyan)]"
-          style={{
-            top: rect.top,
-            left: rect.left,
-            width: rect.width,
-            height: rect.height,
-            boxShadow: '0 0 0 9999px rgba(0, 0, 0, 0.68), 0 0 34px rgba(34, 211, 238, 0.42)',
-          }}
-        />
-      )}
-      <div
-        className="glass-panel fixed max-h-[calc(100vh-2rem)] overflow-y-auto rounded-[var(--r-lg)] p-4 shadow-2xl ring-1 ring-inset ring-[var(--border-strong)]"
-        style={{ top: cardTop, left: cardLeft, width: cardWidth }}
-      >
-        <div className="flex items-start justify-between gap-3">
-          <div>
-            <p className="text-[11px] font-semibold uppercase tracking-wide text-[var(--faint)]">
-              Step {stepIndex + 1} of {steps.length}
-            </p>
-            <h2 className="mt-1 text-lg font-semibold text-[var(--fg)]">{step.title}</h2>
-          </div>
-          <button
-            type="button"
-            onClick={onDismiss}
-            className="rounded-[var(--r-md)] p-1.5 text-[var(--faint)] transition hover:bg-[var(--surface-2)] hover:text-[var(--fg)]"
-            aria-label="Skip tour"
-          >
-            <X size={16} />
-          </button>
-        </div>
-        <p className="mt-2 text-sm leading-relaxed text-[var(--muted)]">{step.body}</p>
-        <div className="mt-4 flex items-center justify-between gap-2">
-          <button
-            type="button"
-            onClick={() => onStepChange(Math.max(0, stepIndex - 1))}
-            disabled={stepIndex === 0}
-            className="btn-ghost rounded-[var(--r-md)] px-3 py-2 text-sm disabled:cursor-not-allowed disabled:opacity-45"
-          >
-            Back
-          </button>
-          <div className="flex items-center gap-2">
-            <button type="button" onClick={onDismiss} className="px-2 py-2 text-sm text-[var(--faint)] hover:text-[var(--fg)]">
-              Skip tour
-            </button>
-            <button
-              type="button"
-              onClick={() => (isLast ? onDismiss() : onStepChange(Math.min(steps.length - 1, stepIndex + 1)))}
-              className="btn-primary rounded-[var(--r-md)] px-4 py-2 text-sm"
-            >
-              {isLast ? 'Done' : 'Next'}
-            </button>
-          </div>
-        </div>
-      </div>
-    </div>,
-    document.body
-  );
-}
-
-function BetaTrialEndedScreen({
-  slug,
-  hostToken,
-  analytics,
-  analyticsRefreshing,
-  analyticsUpdatedAt,
-  onRefresh,
-}: {
-  slug: string;
-  hostToken: string;
-  analytics: Analytics | null;
-  analyticsRefreshing: boolean;
-  analyticsUpdatedAt: number | null;
-  onRefresh: () => void;
-}) {
-  const [expediteRequested, setExpediteRequested] = useState(false);
-  const [expediteBusy, setExpediteBusy] = useState(false);
-  const [rating, setRating] = useState<number>(0);
-  const [feedback, setFeedback] = useState('');
-  const [feedbackBusy, setFeedbackBusy] = useState(false);
-  const [savedFeedback, setSavedFeedback] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const requestExpedite = async () => {
-    setExpediteBusy(true);
-    setError(null);
-    try {
-      await requestBetaTrialExpedite(slug, hostToken);
-      setExpediteRequested(true);
-    } catch (e) {
-      setError(String((e as Error).message ?? e));
-    } finally {
-      setExpediteBusy(false);
-    }
-  };
-
-  const submitFeedback = async () => {
-    if (!rating) {
-      setError('Choose a rating first.');
-      return;
-    }
-    setFeedbackBusy(true);
-    setError(null);
-    try {
-      await submitBetaTrialFeedback(slug, hostToken, { rating, feedback });
-      setSavedFeedback(true);
-    } catch (e) {
-      setError(String((e as Error).message ?? e));
-    } finally {
-      setFeedbackBusy(false);
-    }
-  };
-
-  return (
-    <div className="bg-aurora min-h-screen px-4 py-6 sm:px-6 lg:py-10">
-      <main className="animate-fade-up mx-auto grid max-w-5xl gap-5 lg:grid-cols-[minmax(0,1fr)_24rem]">
-        <section className="glass-panel rounded-2xl p-5 text-[var(--fg)] shadow-xl sm:p-6">
-          <p className="grad-text text-xs font-bold uppercase tracking-widest">Beta trial complete</p>
-          <h1 className="mt-2 text-2xl font-bold">Here is what happened in your 90-second run</h1>
-          <div className="mt-5 grid gap-2 sm:grid-cols-4">
-            <Stat label="Joined" value={analytics?.uniqueAttendees ?? 0} />
-            <Stat label="Peak" value={analytics?.peakConcurrent ?? 0} />
-            <Stat label="Avg watch" value={fmtDur(analytics?.avgWatchMs ?? 0)} />
-            <Stat label="Total watch" value={fmtDur(analytics?.totalWatchMs ?? 0)} />
-          </div>
-
-          <div className="mt-5 flex items-center justify-between">
-            <div>
-              <h2 className="text-sm font-semibold text-[var(--fg)]">Audience analytics</h2>
-              {analyticsUpdatedAt && (
-                <p className="mt-0.5 text-xs text-[var(--faint)]">Updated {fmtTime(analyticsUpdatedAt)}</p>
-              )}
-            </div>
-            <button
-              onClick={onRefresh}
-              disabled={analyticsRefreshing}
-              className="btn-ghost flex items-center gap-1.5 rounded-[var(--r-md)] px-3 py-1.5 text-xs"
-            >
-              <RotateCw size={14} className={analyticsRefreshing ? 'animate-spin' : undefined} />
-              Refresh
-            </button>
-          </div>
-
-          {analytics && analytics.attendees.length > 0 ? (
-            <div className="mt-3 max-h-64 space-y-0.5 overflow-y-auto rounded-xl bg-[var(--surface-2)] p-1.5 ring-1 ring-inset ring-[var(--border)]">
-              {analytics.attendees.map((a, i) => (
-                <div key={i} className="flex items-center justify-between gap-3 rounded-lg px-2 py-1.5 text-xs">
-                  <div className="min-w-0">
-                    <div className="truncate font-medium text-[var(--fg)]">{a.name || 'Anonymous'}</div>
-                    {a.company && <div className="truncate text-[var(--faint)]">{a.company}</div>}
-                  </div>
-                  <span className="shrink-0 font-mono text-[var(--muted)]">{fmtDur(a.watchedMs)}</span>
-                </div>
-              ))}
-            </div>
-          ) : (
-            <p className="mt-3 rounded-[var(--r-md)] bg-[var(--surface-2)] px-3 py-3 text-sm text-[var(--muted)] ring-1 ring-inset ring-[var(--border)]">
-              No audience joins were recorded. For the next run, scan the QR code on your phone before pressing Start.
-            </p>
-          )}
-        </section>
-
-        <aside className="space-y-4">
-          <div className="glass-panel rounded-2xl p-4 text-[var(--fg)]">
-            <h2 className="text-sm font-semibold">Next run</h2>
-            <p className="mt-1 text-xs leading-relaxed text-[var(--muted)]">
-              Bring your own Gemini key to run a private trial for up to 15 minutes and 10 viewers.
-            </p>
-            <a href="/try" className="btn-primary mt-3 flex items-center justify-center gap-1.5 rounded-[var(--r-md)] px-3 py-2 text-sm">
-              Bring my key <ExternalLink size={14} />
-            </a>
-            <button
-              onClick={requestExpedite}
-              disabled={expediteBusy || expediteRequested}
-              className="btn-ghost mt-2 w-full rounded-[var(--r-md)] px-3 py-2 text-sm disabled:opacity-60"
-            >
-              {expediteRequested ? 'Expedited trial requested' : expediteBusy ? 'Saving...' : 'Expedite hosted follow-up'}
-            </button>
-          </div>
-
-          <div className="glass-panel rounded-2xl p-4 text-[var(--fg)]">
-            <h2 className="text-sm font-semibold">Feedback</h2>
-            <div className="mt-3 grid grid-cols-5 gap-1">
-              {[1, 2, 3, 4, 5].map((n) => (
-                <button
-                  key={n}
-                  type="button"
-                  onClick={() => {
-                    setRating(n);
-                    setSavedFeedback(false);
-                  }}
-                  className={`rounded-[var(--r-md)] px-2 py-2 text-sm font-semibold ring-1 ring-inset ${
-                    rating === n
-                      ? 'grad-fill ring-transparent'
-                      : 'bg-[var(--surface-2)] text-[var(--muted)] ring-[var(--border)]'
-                  }`}
-                >
-                  {n}
-                </button>
-              ))}
-            </div>
-            <textarea
-              value={feedback}
-              onChange={(e) => {
-                setFeedback(e.target.value);
-                setSavedFeedback(false);
-              }}
-              placeholder="What worked? What blocked you?"
-              className="input-field mt-3 min-h-24 w-full px-3 py-2 text-sm text-[var(--fg)] placeholder:text-[var(--faint)]"
-            />
-            <button
-              onClick={submitFeedback}
-              disabled={feedbackBusy}
-              className="btn-primary mt-3 w-full rounded-[var(--r-md)] px-3 py-2 text-sm disabled:opacity-60"
-            >
-              {feedbackBusy ? 'Saving...' : savedFeedback ? 'Feedback saved' : 'Save feedback'}
-            </button>
-            {error && <p className="mt-2 text-xs text-error">{error}</p>}
-          </div>
-        </aside>
-      </main>
     </div>
   );
 }
@@ -497,22 +69,16 @@ function dspFor(roomMode: boolean, browserDsp: boolean): DspConfig {
 }
 
 export default function Host() {
-  const { slug = '' } = useParams();
-  // Trial sessions authenticate the host with a per-session token (from /try),
-  // so they skip the admin-secret gate entirely.
-  const trialToken = getTrialHostToken(slug);
-  if (trialToken) return <HostInner authToken={trialToken} isTrial />;
   return (
     <AdminKeyGate>
-      <HostInner authToken={null} isTrial={false} />
+      <HostInner />
     </AdminKeyGate>
   );
 }
 
-function HostInner({ authToken, isTrial }: { authToken: string | null; isTrial: boolean }) {
+function HostInner() {
   const { slug = '' } = useParams();
-  // Auth used for the host WS and analytics: trial token, else the admin key.
-  const auth = isTrial ? authToken ?? '' : getAdminKey() ?? '';
+  const auth = getAdminKey() ?? '';
   const [session, setSession] = useState<SessionInfo | null>(null);
   const [state, setState] = useState<string>('created');
   const [slideIndex, setSlideIndex] = useState(0);
@@ -548,18 +114,10 @@ function HostInner({ authToken, isTrial }: { authToken: string | null; isTrial: 
   const [confirmStop, setConfirmStop] = useState(false);
   const [confirmDeletePoll, setConfirmDeletePoll] = useState(false);
   const [routing, setRouting] = useState<Routing>('viewers');
-  const [tourActive, setTourActive] = useState(false);
-  const [tourDismissed, setTourDismissed] = useState(false);
-  const [tourStepIndex, setTourStepIndex] = useState(0);
   const [advancedAudioOpen, setAdvancedAudioOpen] = useState(false);
-  const [nowMs, setNowMs] = useState(Date.now());
-  const [localTrialStartedAtMs, setLocalTrialStartedAtMs] = useState<number | null>(null);
-  const isBetaTrial = session?.trialKind === 'beta';
   const hasSession = !!session;
 
   const sockRef = useRef<SessionSocket | null>(null);
-  const sessionRef = useRef<SessionInfo | null>(null);
-  sessionRef.current = session;
   const micRef = useRef<MicCapture | null>(null);
   const micIdRef = useRef(micId);
   micIdRef.current = micId;
@@ -576,14 +134,6 @@ function HostInner({ authToken, isTrial }: { authToken: string | null; isTrial: 
   const roomModeRef = useRef(false);
   roomModeRef.current = roomMode;
   const analyticsRefreshInFlightRef = useRef(false);
-  const startStatusTourRef = useRef<HTMLDivElement>(null);
-  const slideNavTourRef = useRef<HTMLDivElement>(null);
-  const microphoneTourRef = useRef<HTMLDivElement>(null);
-  const routingTourRef = useRef<HTMLFieldSetElement>(null);
-  const advancedAudioTourRef = useRef<HTMLDetailsElement>(null);
-  const audienceLinkTourRef = useRef<HTMLDivElement>(null);
-  const pollsTourRef = useRef<HTMLDivElement>(null);
-  const analyticsTourRef = useRef<HTMLDivElement>(null);
 
   const output = useSyncedTranscriptLines({
     enabled: AUDIO_SYNC_V2,
@@ -621,7 +171,6 @@ function HostInner({ authToken, isTrial }: { authToken: string | null; isTrial: 
       setSession(s);
       setState(s.state);
       setSlideIndex(s.slideIndex);
-      setLocalTrialStartedAtMs(sqliteUtcMs(s.startedAt));
     });
     void refreshAudioDevices(true).then(({ inputs }) => {
       if (!micIdRef.current && inputs[0]) selectMicId(inputs[0].deviceId);
@@ -653,13 +202,6 @@ function HostInner({ authToken, isTrial }: { authToken: string | null; isTrial: 
         case 'session.state': {
           const next = (msg.payload as { state: string }).state;
           setState(next);
-          if (sessionRef.current?.trialKind === 'beta' && next === 'live') {
-            setLocalTrialStartedAtMs((current) => current ?? Date.now());
-            void fetchSession(slug).then((s) => {
-              setSession(s);
-              setLocalTrialStartedAtMs((current) => sqliteUtcMs(s.startedAt) ?? current);
-            });
-          }
           if (next === 'live') setTranslationError(null); // recovered
           break;
         }
@@ -896,15 +438,9 @@ function HostInner({ authToken, isTrial }: { authToken: string | null; isTrial: 
     const options = pairs.map((p) => p.o);
     const correctOptions = pairs.map((p, i) => (p.correct ? i : -1)).filter((i) => i >= 0);
     sockRef.current?.send('poll.open', { question: pollQuestion.trim(), options, correctOptions });
-    if (isTrial) {
-      setPollQuestion(TRIAL_SAMPLE_POLL.question);
-      setPollOptions(TRIAL_SAMPLE_POLL.options);
-      setPollCorrect(TRIAL_SAMPLE_POLL.correct);
-    } else {
-      setPollQuestion('');
-      setPollOptions(EMPTY_POLL_OPTIONS);
-      setPollCorrect(EMPTY_POLL_CORRECT);
-    }
+    setPollQuestion('');
+    setPollOptions(EMPTY_POLL_OPTIONS);
+    setPollCorrect(EMPTY_POLL_CORRECT);
   };
   const pollAction = (type: 'poll.close' | 'poll.hide' | 'poll.delete' | 'poll.pin', pinned?: boolean) => {
     if (poll.poll) sockRef.current?.send(type, { pollId: poll.poll.id, pinned });
@@ -988,44 +524,6 @@ function HostInner({ authToken, isTrial }: { authToken: string | null; isTrial: 
     setTab(next);
   };
 
-  const startBetaTour = useCallback(() => {
-    setTab('setup');
-    setAdvancedAudioOpen(false);
-    setTourStepIndex(0);
-    setTourActive(true);
-  }, []);
-
-  const closeBetaTour = useCallback(() => {
-    dismissBetaTour(slug);
-    setTourDismissed(true);
-    setTourActive(false);
-  }, [slug]);
-
-  const getTourTarget = useCallback((target: TourTarget): HTMLElement | null => {
-    switch (target) {
-      case 'startStatus':
-        return startStatusTourRef.current;
-      case 'slideNav':
-        return slideNavTourRef.current;
-      case 'microphone':
-        return microphoneTourRef.current;
-      case 'routing':
-        return routingTourRef.current;
-      case 'advancedAudio':
-        return advancedAudioTourRef.current;
-      case 'audienceLink':
-        return audienceLinkTourRef.current;
-      case 'polls':
-        return pollsTourRef.current;
-      case 'analytics':
-        return analyticsTourRef.current;
-    }
-  }, []);
-
-  const setTourStep = useCallback((index: number) => {
-    setTourStepIndex(clamp(index, 0, BETA_SETUP_TOUR_STEPS.length - 1));
-  }, []);
-
   // Auto-select routing from the session's mode once it loads (in-person hosts
   // are the room PA; remote hosts stay silent). Replaces the old roomMode auto-
   // effect; the player is still enabled at Start, not here.
@@ -1036,41 +534,10 @@ function HostInner({ authToken, isTrial }: { authToken: string | null; isTrial: 
   }, [session]);
 
   useEffect(() => {
-    if (!isTrial || poll.poll) return;
-    if (pollQuestion.trim() || pollOptions.some((option) => option.trim())) return;
-    setPollQuestion(TRIAL_SAMPLE_POLL.question);
-    setPollOptions(TRIAL_SAMPLE_POLL.options);
-    setPollCorrect(TRIAL_SAMPLE_POLL.correct);
-  }, [isTrial, poll.poll, pollOptions, pollQuestion]);
-
-  useEffect(() => {
-    if (!isBetaTrial || state !== 'created') {
-      setTourActive(false);
-      return;
-    }
-    const dismissed = isBetaTourDismissed(slug);
-    setTourDismissed(dismissed);
-    if (!dismissed) startBetaTour();
-  }, [isBetaTrial, slug, startBetaTour, state]);
-
-  useEffect(() => {
-    if (!tourActive) return;
-    const step = BETA_SETUP_TOUR_STEPS[tourStepIndex];
-    setTab(step.tab);
-    if (step.target === 'advancedAudio') setAdvancedAudioOpen(true);
-  }, [tourActive, tourStepIndex]);
-
-  useEffect(() => {
     if (state !== 'live' && micRef.current) {
       micRef.current.streaming = false;
     }
   }, [state]);
-
-  useEffect(() => {
-    if (!isBetaTrial || (state !== 'live' && state !== 'paused')) return;
-    const id = window.setInterval(() => setNowMs(Date.now()), 1000);
-    return () => clearInterval(id);
-  }, [isBetaTrial, state]);
 
   // Drop the two-step confirmations whenever the relevant state changes.
   useEffect(() => {
@@ -1116,19 +583,11 @@ function HostInner({ authToken, isTrial }: { authToken: string | null; isTrial: 
     }
   }, [slug, auth]);
 
-  const analyticsIntervalMs =
-    isBetaTrial && state !== 'ended' ? BETA_ANALYTICS_REFRESH_MS : ANALYTICS_REFRESH_MS;
-
   useEffect(() => {
     void refreshAnalytics();
-    const id = window.setInterval(() => void refreshAnalytics(), analyticsIntervalMs);
+    const id = window.setInterval(() => void refreshAnalytics(), ANALYTICS_REFRESH_MS);
     return () => clearInterval(id);
-  }, [analyticsIntervalMs, refreshAnalytics]);
-
-  useEffect(() => {
-    if (!isBetaTrial) return;
-    void refreshAnalytics();
-  }, [isBetaTrial, refreshAnalytics, state, viewerCount]);
+  }, [refreshAnalytics]);
 
   // We route monitor/PA audio through a media element, so element setSinkId
   // counts too (broader support than AudioContext.setSinkId).
@@ -1153,26 +612,6 @@ function HostInner({ authToken, isTrial }: { authToken: string | null; isTrial: 
           : state === 'ended'
             ? 'bg-[var(--muted)]/15 text-[var(--muted)] ring-[var(--border)]'
             : 'bg-[var(--surface-2)] text-[var(--muted)] ring-[var(--border)]';
-
-  const trialStartedAtMs = localTrialStartedAtMs ?? sqliteUtcMs(session.startedAt);
-  const trialRuntimeMs = session.trialRuntimeMs ?? (session.trialKind === 'beta' ? 2 * 60_000 : 15 * 60_000);
-  const trialRemainingMs =
-    trialStartedAtMs && isBetaTrial && (state === 'live' || state === 'paused')
-      ? Math.max(0, trialStartedAtMs + trialRuntimeMs - nowMs)
-      : null;
-
-  if (isBetaTrial && state === 'ended') {
-    return (
-      <BetaTrialEndedScreen
-        slug={slug}
-        hostToken={auth}
-        analytics={analytics}
-        analyticsRefreshing={analyticsRefreshing}
-        analyticsUpdatedAt={analyticsUpdatedAt}
-        onRefresh={() => void refreshAnalytics()}
-      />
-    );
-  }
 
   return (
     <div className="flex h-screen bg-[var(--bg)]">
@@ -1209,18 +648,8 @@ function HostInner({ authToken, isTrial }: { authToken: string | null; isTrial: 
             <h1 className="truncate text-lg font-semibold text-[var(--fg)]">{session.title || 'Untitled talk'}</h1>
             <ThemeToggle />
           </div>
-          <div ref={startStatusTourRef} className="space-y-3">
+          <div className="space-y-3">
             <div className="flex flex-wrap items-center gap-1.5 text-xs">
-              {isTrial && (
-                <span className="rounded-full bg-info-soft px-2.5 py-1 font-semibold uppercase tracking-wide text-info ring-1 ring-inset ring-info">
-                  {session.trialKind === 'beta' ? 'Beta trial · 2 min · 10 viewers' : 'Trial · 15 min · 10 viewers'}
-                </span>
-              )}
-              {trialRemainingMs !== null && (
-                <span className="rounded-full bg-warning-soft px-2.5 py-1 font-semibold uppercase tracking-wide text-warning ring-1 ring-inset ring-warning">
-                  {fmtDur(trialRemainingMs)} left
-                </span>
-              )}
               <span className={`flex items-center gap-1.5 rounded-full px-2.5 py-1 font-semibold uppercase tracking-wide ring-1 ring-inset ${stateStyle}`}>
                 {state === 'live' && <span className="live-dot" />}
                 <span className={state === 'live' ? 'grad-text' : undefined}>{state}</span>
@@ -1258,15 +687,9 @@ function HostInner({ authToken, isTrial }: { authToken: string | null; isTrial: 
                 </button>
               )}
               {state === 'ended' && (
-                isTrial ? (
-                  <div className="flex flex-1 items-center justify-center rounded-[var(--r-md)] bg-[var(--surface-2)] px-3 py-2.5 text-center text-sm font-semibold text-[var(--muted)] ring-1 ring-inset ring-[var(--border)]">
-                    {session.trialKind === 'beta' ? 'Beta trial ended after 2 minutes' : 'Trial ended after 15 minutes'}
-                  </div>
-                ) : (
-                  <button onClick={onResume} className="btn-primary flex flex-1 items-center justify-center gap-2 rounded-[var(--r-md)] py-2.5">
-                    <RotateCw size={18} /> Restart session
-                  </button>
-                )
+                <button onClick={onResume} className="btn-primary flex flex-1 items-center justify-center gap-2 rounded-[var(--r-md)] py-2.5">
+                  <RotateCw size={18} /> Restart session
+                </button>
               )}
               {(state === 'live' || state === 'paused') &&
                 (confirmStop ? (
@@ -1298,7 +721,7 @@ function HostInner({ authToken, isTrial }: { authToken: string | null; isTrial: 
           </button>
 
           {/* Slide nav */}
-          <div ref={slideNavTourRef} className="flex items-center gap-2">
+          <div className="flex items-center gap-2">
             <button onClick={() => changeSlide(-1)} aria-label="Previous slide" className="btn-ghost flex items-center justify-center rounded-[var(--r-md)] px-4 py-2.5">
               <ChevronLeft size={18} />
             </button>
@@ -1332,49 +755,16 @@ function HostInner({ authToken, isTrial }: { authToken: string | null; isTrial: 
         <div className="flex-1 overflow-y-auto p-4">
           {tab === 'setup' && (
             <div className="space-y-4">
-              {isBetaTrial && state === 'created' && (
-                <div className="rounded-[var(--r-lg)] bg-info-soft p-3.5 text-sm text-info ring-1 ring-inset ring-info">
-                  <p className="font-semibold">Guided setup tour</p>
-                  <p className="mt-1.5 leading-relaxed">
-                    Walk through the host console before going live. You can skip it and start whenever you are ready.
-                  </p>
-                  <div className="mt-3 flex gap-2">
-                    <button
-                      type="button"
-                      onClick={startBetaTour}
-                      className="btn-primary flex flex-1 items-center justify-center rounded-[var(--r-md)] px-3 py-2 text-sm"
-                    >
-                      {tourDismissed ? 'Replay tour' : 'Take tour'}
-                    </button>
-                    {!tourDismissed && (
-                      <button
-                        type="button"
-                        onClick={closeBetaTour}
-                        className="btn-ghost rounded-[var(--r-md)] px-3 py-2 text-sm"
-                      >
-                        Skip
-                      </button>
-                    )}
-                  </div>
-                </div>
-              )}
-
         {/* Microphone + one guided routing choice (collapses once live since it
             is configured pre-talk; advanced options behind a disclosure). */}
-        <details open={isBetaTrial || state !== 'live'} className="rounded-[var(--r-lg)] bg-[var(--surface-2)] p-3.5 ring-1 ring-inset ring-[var(--border)]">
+        <details open={state !== 'live'} className="rounded-[var(--r-lg)] bg-[var(--surface-2)] p-3.5 ring-1 ring-inset ring-[var(--border)]">
           <summary className="cursor-pointer list-none text-xs font-semibold uppercase tracking-wide text-[var(--faint)]">
             Microphone &amp; audio
           </summary>
 
           <div className="mt-3 space-y-4">
-            {isBetaTrial && (
-              <p className="rounded-[var(--r-md)] bg-warning-soft px-3 py-2 text-xs leading-relaxed text-warning ring-1 ring-inset ring-warning">
-                Wear headphones for the beta trial whenever possible. It keeps translated audio from
-                feeding back into your microphone.
-              </p>
-            )}
             {/* Mic */}
-            <div ref={microphoneTourRef} className="space-y-2.5">
+            <div className="space-y-2.5">
               <label className="text-xs font-semibold uppercase tracking-wide text-[var(--faint)]">Microphone</label>
               <select
                 value={micId}
@@ -1401,7 +791,7 @@ function HostInner({ authToken, isTrial }: { authToken: string | null; isTrial: 
             </div>
 
             {/* Routing — the single primary audio choice */}
-            <fieldset ref={routingTourRef} className="space-y-2">
+            <fieldset className="space-y-2">
               <legend className="mb-1 text-xs font-semibold uppercase tracking-wide text-[var(--faint)]">
                 Where does translated audio play?
               </legend>
@@ -1432,7 +822,6 @@ function HostInner({ authToken, isTrial }: { authToken: string | null; isTrial: 
 
             {/* Advanced — output device, half-duplex, browser DSP, warnings */}
             <details
-              ref={advancedAudioTourRef}
               open={advancedAudioOpen}
               onToggle={(e) => setAdvancedAudioOpen(e.currentTarget.open)}
               className="rounded-[var(--r-md)] bg-[var(--surface)] p-3 ring-1 ring-inset ring-[var(--border)]"
@@ -1512,13 +901,8 @@ function HostInner({ authToken, isTrial }: { authToken: string | null; isTrial: 
         </details>
 
         {/* Share */}
-        <div ref={audienceLinkTourRef} className="space-y-3">
+        <div className="space-y-3">
           <label className="text-xs font-semibold uppercase tracking-wide text-[var(--faint)]">Audience link</label>
-          {isBetaTrial && state === 'created' && (
-            <p className="rounded-[var(--r-md)] bg-[var(--surface-2)] px-3 py-2 text-xs leading-relaxed text-[var(--muted)] ring-1 ring-inset ring-[var(--border)]">
-              Scan this QR code on your phone before starting so Analytics has a live viewer to track.
-            </p>
-          )}
           <div className="flex justify-center">
             <QrCode url={viewerUrl} size={156} />
           </div>
@@ -1558,7 +942,7 @@ function HostInner({ authToken, isTrial }: { authToken: string | null; isTrial: 
           )}
 
           {tab === 'polls' && (
-            <div ref={pollsTourRef} className="space-y-3">
+            <div className="space-y-3">
           <label className="text-xs font-semibold uppercase tracking-wide text-[var(--faint)]">
             Live poll / quiz
           </label>
@@ -1677,7 +1061,7 @@ function HostInner({ authToken, isTrial }: { authToken: string | null; isTrial: 
           )}
 
           {tab === 'audience' && (
-            <div ref={analyticsTourRef} className="space-y-3">
+            <div className="space-y-3">
           <div className="flex items-center justify-between">
             <div>
               <label className="text-xs font-semibold uppercase tracking-wide text-[var(--faint)]">
@@ -1750,17 +1134,6 @@ function HostInner({ authToken, isTrial }: { authToken: string | null; isTrial: 
           )}
         </div>
       </aside>
-
-      {tourActive && isBetaTrial && state === 'created' && (
-        <GuidedSetupTour
-          steps={BETA_SETUP_TOUR_STEPS}
-          stepIndex={tourStepIndex}
-          layoutKey={`${tab}:${advancedAudioOpen}`}
-          getTarget={getTourTarget}
-          onStepChange={setTourStep}
-          onDismiss={closeBetaTour}
-        />
-      )}
 
       {pip.container &&
         createPortal(

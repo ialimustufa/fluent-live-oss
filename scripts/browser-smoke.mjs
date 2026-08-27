@@ -101,22 +101,6 @@ async function createPdfSession(title = 'Browser Smoke PDF') {
   return res.json();
 }
 
-async function createBetaTrialSession() {
-  const form = new FormData();
-  form.set('fullName', 'Browser Smoke Beta');
-  form.set('email', `browser-smoke-beta-${Date.now()}@acme.co`);
-  form.set('company', 'Acme Co');
-  form.set('budget', '$50-$100/hour');
-  form.set('title', 'Browser Smoke Beta');
-  form.set('targetLang', 'es');
-  form.set('presentationMode', 'remote');
-  form.set('slideType', 'pdf');
-  form.set('file', new File([makePdf()], 'browser-smoke-beta.pdf', { type: 'application/pdf' }));
-  const res = await fetch(`${BASE}/api/beta/trial`, { method: 'POST', body: form });
-  if (!res.ok) throw new Error(`create beta trial HTTP ${res.status}: ${await res.text()}`);
-  return res.json();
-}
-
 async function connectHost(slug) {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws/${slug}`);
@@ -187,14 +171,6 @@ async function endSession(slug) {
       reject(error);
     });
   });
-}
-
-async function visible(locator) {
-  try {
-    return await locator.isVisible();
-  } catch {
-    return false;
-  }
 }
 
 async function checkNoPersonalSignupUi(page, label) {
@@ -294,10 +270,6 @@ try {
   check('home page does not load PDF chunk', rootPdfRequests.length === 0, rootPdfRequests.join('\n'));
   await checkNoPersonalSignupUi(page, 'home page');
 
-  await page.goto(`${BASE}/try`, { waitUntil: 'networkidle' });
-  await page.getByRole('heading', { name: /Start a test presentation/i }).waitFor();
-  await checkNoPersonalSignupUi(page, 'trial page');
-
   phase = 'viewer';
   await page.goto(`${BASE}/${created.slug}/resource`, { waitUntil: 'networkidle' });
   await page.waitForURL(`${BASE}${created.viewerPath}`);
@@ -383,48 +355,6 @@ try {
     'ended-session screen links to the transcript',
     (await transcriptLink.getAttribute('href')) === `/${created.slug}/transcript`
   );
-
-  const betaCreated = await createBetaTrialSession();
-  await page.evaluate(({ slug, hostToken }) => {
-    sessionStorage.setItem(`fluent.trialHost.${slug}`, hostToken);
-  }, betaCreated);
-  await page.goto(`${BASE}${betaCreated.hostPath}`, { waitUntil: 'domcontentloaded' });
-  const betaTour = page.getByRole('dialog', { name: /Beta setup tour/i });
-  await betaTour.waitFor({ timeout: 15000 });
-  check('beta host setup tour auto-opens', await visible(betaTour));
-  check('beta host Start stays enabled during tour', await page.getByRole('button', { name: /^Start$/i }).isEnabled());
-
-  for (let i = 0; i < 6; i += 1) {
-    await betaTour.getByRole('button', { name: /^Next$/i }).click();
-  }
-  await betaTour.getByRole('heading', { name: /Live polls/i }).waitFor({ timeout: 5000 });
-  const betaPollQuestion = page.getByPlaceholder('Poll / quiz question');
-  await betaPollQuestion.waitFor({ timeout: 5000 });
-  check(
-    'beta tour advances to Polls tab',
-    (await visible(betaTour.getByRole('heading', { name: /Live polls/i }))) &&
-      (await visible(betaPollQuestion))
-  );
-
-  await betaTour.getByRole('button', { name: /^Next$/i }).click();
-  await betaTour.getByRole('heading', { name: /^Analytics$/i }).waitFor({ timeout: 5000 });
-  const betaAttendanceRefresh = page.getByRole('button', { name: /Refresh.*attendance/i });
-  await betaAttendanceRefresh.waitFor({ timeout: 5000 });
-  check(
-    'beta tour advances to Analytics tab',
-    (await visible(betaTour.getByRole('heading', { name: /^Analytics$/i }))) &&
-      (await visible(betaAttendanceRefresh))
-  );
-
-  await betaTour.getByRole('button', { name: /^Skip tour$/i }).last().click();
-  await page.waitForTimeout(100);
-  check('beta tour skip closes dialog', !(await visible(betaTour)));
-
-  await page.getByRole('button', { name: /^Setup$/i }).click();
-  await page.getByRole('button', { name: /^Replay tour$/i }).click();
-  await betaTour.waitFor({ timeout: 5000 });
-  check('beta tour can be replayed after skip', await visible(betaTour));
-  await betaTour.getByRole('button', { name: /^Skip tour$/i }).last().click();
 
   check('Google Analytics is not loaded without VITE_GA_MEASUREMENT_ID', analyticsRequests.length === 0, analyticsRequests.join('\n'));
   check(

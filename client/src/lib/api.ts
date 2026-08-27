@@ -10,9 +10,6 @@ export interface SessionInfo {
   startedAt: string | null;
   endedAt: string | null;
   presentationMode: 'in_person' | 'remote';
-  trialKind: 'try' | 'beta' | null;
-  trialRuntimeMs: number | null;
-  trialMaxViewers: number | null;
   audio: {
     transport: 'sfu' | 'none';
     available: boolean;
@@ -128,39 +125,11 @@ export interface SessionListItem {
   presentationMode: 'in_person' | 'remote';
 }
 
-export interface BetaLead {
-  id: number;
-  email: string;
-  normalizedEmail: string;
-  fullName: string;
-  company: string;
-  budget: string;
-  sessionSlug: string;
-  duplicateAttempts: number;
-  expediteRequested: boolean;
-  expediteRequestedAt: string | null;
-  feedbackRating: number | null;
-  feedback: string;
-  feedbackSubmittedAt: string | null;
-  firstTrialAt: string;
-  lastDuplicateAt: string | null;
-  createdAt: string;
-  updatedAt: string;
-}
-
 export async function listSessions(adminKey: string): Promise<SessionListItem[]> {
   const res = await fetch('/api/sessions', {
     headers: { Authorization: `Bearer ${adminKey}` },
   });
   if (!res.ok) throw new Error(`list HTTP ${res.status}`);
-  return res.json();
-}
-
-export async function listBetaLeads(adminKey: string): Promise<BetaLead[]> {
-  const res = await fetch('/api/beta/leads', {
-    headers: { Authorization: `Bearer ${adminKey}` },
-  });
-  if (!res.ok) throw new Error(`beta leads HTTP ${res.status}`);
   return res.json();
 }
 
@@ -222,63 +191,6 @@ export async function createSession(
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
     throw new Error(body.error ?? `HTTP ${res.status}`);
-  }
-  return res.json();
-}
-
-/** Self-serve trial: form includes the visitor's own geminiApiKey. No admin. */
-export async function createTrial(
-  form: FormData
-): Promise<{ slug: string; hostToken: string; viewerPath: string; hostPath: string }> {
-  const res = await fetch('/api/try', { method: 'POST', body: form });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
-    throw new Error(body.error ?? `HTTP ${res.status}`);
-  }
-  return res.json();
-}
-
-/** Hosted beta trial: no user Gemini key; server uses its configured key. */
-export async function createBetaTrial(
-  form: FormData
-): Promise<{ slug: string; hostToken: string; viewerPath: string; hostPath: string }> {
-  const res = await fetch('/api/beta/trial', { method: 'POST', body: form });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
-    throw new Error(body.error ?? `HTTP ${res.status}`);
-  }
-  return res.json();
-}
-
-export async function requestBetaTrialExpedite(slug: string, hostToken: string): Promise<{
-  ok: boolean;
-  expediteRequested: boolean;
-  expediteRequestedAt: string | null;
-}> {
-  const res = await fetch(`/api/beta/trial/${slug}/expedite`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${hostToken}` },
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
-    throw new Error(body.error ?? `HTTP ${res.status}`);
-  }
-  return res.json();
-}
-
-export async function submitBetaTrialFeedback(
-  slug: string,
-  hostToken: string,
-  body: { rating: number; feedback: string }
-): Promise<{ ok: boolean; rating: number; feedback: string; feedbackSubmittedAt: string | null }> {
-  const res = await fetch(`/api/beta/trial/${slug}/feedback`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${hostToken}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const responseBody = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
-    throw new Error(responseBody.error ?? `HTTP ${res.status}`);
   }
   return res.json();
 }

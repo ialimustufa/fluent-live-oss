@@ -24,7 +24,6 @@ function privacyOptedOut(): boolean {
 function categoryForPath(pathname: string): string {
   if (pathname === '/') return 'home';
   if (pathname === '/new') return 'new';
-  if (pathname === '/try') return 'try';
   if (pathname === '/admin') return 'admin';
   if (/^\/[^/]+\/host$/.test(pathname)) return 'host';
   if (/^\/[^/]+\/present$/.test(pathname)) return 'present';

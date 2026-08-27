@@ -41,7 +41,6 @@ const REACTION_COOLDOWN_MS = 5 * 60_000;
 const REACTION_VIOLATION_DECAY_MS = 60_000;
 const MAX_SOCKET_BUFFERED_AMOUNT = 1_000_000;
 const AUDIO_SYNC_LOG_EVERY = 100;
-export const TRIAL_RUNTIME_MS = 5 * 60 * 1000;
 
 interface RecentFinal {
   kind: 'input' | 'output';
@@ -68,8 +67,6 @@ export class Room {
   private seq = 0;
   private startedAtMs: number | null = null;
   private pauseTimer: NodeJS.Timeout | null = null;
-  private liveLimitEndsAtMs: number | null = null;
-  private liveLimitTimer: NodeJS.Timeout | null = null;
   // Attendance: sockets map to viewer IDs, while watch time is counted once per
   // active viewer ID so multiple tabs cannot inflate duration.
   private conns = new Map<WebSocket, { viewerId: string }>();
@@ -103,9 +100,8 @@ export class Room {
   constructor(
     public session: SessionRow,
     private geminiApiKey: string,
-    /** Cap on concurrent viewers (trial sessions use per-flow caps; normal = configured default). */
-    public readonly maxViewers: number = Infinity,
-    private readonly liveLimitMs: number | null = null
+    /** Cap on concurrent viewers for this server instance. */
+    public readonly maxViewers: number = Infinity
   ) {
     this.state = session.state;
     this.slideIndex = 0;
@@ -287,10 +283,6 @@ export class Room {
   // --- session lifecycle (admin-only actions; auth enforced in ws.ts) ---
 
   start(): void {
-    if (this.liveLimitEndsAtMs !== null && Date.now() >= this.liveLimitEndsAtMs) {
-      this.stop();
-      return;
-    }
     // Start works from created, paused, OR ended — resuming an ended talk
     // reopens a Gemini session and continues with the same transcript/slide
     // history (recentFinals + DB persist; offsets stay anchored to the start).
@@ -305,7 +297,6 @@ export class Room {
     }
     if (this.startedAtMs === null) this.startedAtMs = Date.now();
     this.setState('live', { markStarted: true, clearEnded: resuming });
-    this.scheduleLiveLimit();
   }
 
   pause(): void {
@@ -323,7 +314,6 @@ export class Room {
   stop(): void {
     if (this.state === 'ended') return;
     this.clearPauseTimer();
-    this.clearLiveLimitTimer();
     this.bridge?.close();
     this.bridge = null;
     void audioFanout?.close(this.session.slug);
@@ -405,15 +395,6 @@ export class Room {
     return this.peakViewers;
   }
 
-  hasOpenConnections(): boolean {
-    const host = this.host;
-    if (host && host.readyState === host.OPEN) return true;
-    for (const ws of this.viewers) {
-      if (ws.readyState === ws.OPEN) return true;
-    }
-    return false;
-  }
-
   handleAudioIn(base64: string, clientSentAtMs?: number): void {
     if (this.state !== 'live') return;
     if (audioSyncMetadata && clientSentAtMs !== undefined) this.recordMicSync(clientSentAtMs);
@@ -437,22 +418,6 @@ export class Room {
     if (this.pauseTimer) {
       clearTimeout(this.pauseTimer);
       this.pauseTimer = null;
-    }
-  }
-
-  private scheduleLiveLimit(): void {
-    if (this.liveLimitMs === null) return;
-    if (this.liveLimitEndsAtMs === null) this.liveLimitEndsAtMs = Date.now() + this.liveLimitMs;
-    this.clearLiveLimitTimer();
-    const delayMs = Math.max(0, this.liveLimitEndsAtMs - Date.now());
-    this.liveLimitTimer = setTimeout(() => this.stop(), delayMs);
-    this.liveLimitTimer.unref?.();
-  }
-
-  private clearLiveLimitTimer(): void {
-    if (this.liveLimitTimer) {
-      clearTimeout(this.liveLimitTimer);
-      this.liveLimitTimer = null;
     }
   }
 
@@ -621,61 +586,12 @@ export function configureRooms(
   audioSyncMetadata = opts.audioSyncMetadata === true;
 }
 
-/**
- * Trial sessions (/try and hosted /beta): Gemini credentials live only in
- * memory here and are discarded when the trial is deleted. A per-session
- * hostToken replaces ADMIN_SECRET for that one session; viewer caps and live
- * runtime are configured by the caller.
- */
-interface TrialConfig {
-  geminiKey: string;
-  hostToken: string;
-  maxViewers: number;
-  ttlMs?: number;
-  runtimeMs?: number;
-  onExpire?: (slug: string) => void | Promise<void>;
-}
-interface TrialRecord extends TrialConfig {
-  expiresAt: number;
-  timer: NodeJS.Timeout;
-}
-
-export const TRIAL_TTL_MS = 2 * 60 * 60 * 1000;
-const MAX_ACTIVE_TRIALS = 50;
-const TRIAL_ACTIVE_RECHECK_MS = 15 * 60 * 1000;
-const trials = new Map<string, TrialRecord>();
-
-export function registerTrial(slug: string, cfg: TrialConfig): boolean {
-  if (trials.size >= MAX_ACTIVE_TRIALS) return false;
-  const ttlMs = cfg.ttlMs ?? TRIAL_TTL_MS;
-  const record: TrialRecord = {
-    ...cfg,
-    ttlMs,
-    expiresAt: Date.now() + ttlMs,
-    timer: setTimeout(() => expireTrial(slug), ttlMs),
-  };
-  record.timer.unref?.();
-  trials.set(slug, record);
-  return true;
-}
-
-export function getTrial(slug: string): TrialConfig | undefined {
-  return trials.get(slug);
-}
-
-export function unregisterTrial(slug: string): void {
-  clearTrial(slug);
-}
-
 export function getOrCreateRoom(slug: string): Room | undefined {
   let room = rooms.get(slug);
   if (!room) {
     const session = getSessionBySlug(slug);
     if (!session) return undefined;
-    const trial = trials.get(slug);
-    room = trial
-      ? new Room(session, trial.geminiKey, trial.maxViewers, trial.runtimeMs ?? TRIAL_RUNTIME_MS)
-      : new Room(session, geminiApiKey, defaultMaxViewers);
+    room = new Room(session, geminiApiKey, defaultMaxViewers);
     rooms.set(slug, room);
   }
   return room;
@@ -696,50 +612,15 @@ function teardownRoom(slug: string, code = 4001, reason = 'session deleted'): vo
   rooms.delete(slug);
 }
 
-function clearTrial(slug: string): TrialRecord | undefined {
-  const trial = trials.get(slug);
-  if (!trial) return undefined;
-  clearTimeout(trial.timer);
-  trials.delete(slug);
-  return trial;
-}
-
-function rescheduleTrialExpiry(slug: string, trial: TrialRecord): void {
-  clearTimeout(trial.timer);
-  const delayMs = Math.min(trial.ttlMs ?? TRIAL_TTL_MS, TRIAL_ACTIVE_RECHECK_MS);
-  trial.expiresAt = Date.now() + delayMs;
-  trial.timer = setTimeout(() => expireTrial(slug), delayMs);
-  trial.timer.unref?.();
-}
-
-function expireTrial(slug: string): void {
-  const trial = trials.get(slug);
-  if (!trial) return;
-  const room = rooms.get(slug);
-  if (room?.hasOpenConnections()) {
-    rescheduleTrialExpiry(slug, trial);
-    return;
-  }
-  clearTrial(slug);
-  teardownRoom(slug);
-  void Promise.resolve(trial.onExpire?.(slug)).catch((err) => {
-    console.error(`[rooms] failed to expire trial ${slug}:`, err);
-  });
-}
-
 /** Tear down a room (on session delete): stop Gemini, drop all sockets. */
 export function deleteRoom(slug: string): void {
   teardownRoom(slug);
-  clearTrial(slug); // discard the in-memory trial key + expiry timer
 }
 
-/** Process shutdown: close bridges, notify sockets, and clear trial timers. */
+/** Process shutdown: close bridges and notify sockets. */
 export function closeAllRooms(): void {
   for (const slug of [...rooms.keys()]) {
     teardownRoom(slug, 1012, 'server shutting down');
-  }
-  for (const slug of [...trials.keys()]) {
-    clearTrial(slug);
   }
   audioFanout?.closeAll();
 }
