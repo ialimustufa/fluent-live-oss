@@ -750,7 +750,11 @@ let slug = '';
   );
 
   const tryRateStatuses = [];
-  for (let i = 0; i < 3; i += 1) {
+  // The limiter uses wall-clock-aligned one-minute windows. A three-request
+  // assertion can straddle a boundary and miss the requests made just above.
+  // Eleven immediate attempts guarantee that at least six land in the same
+  // window, even when the sequence crosses one boundary.
+  for (let i = 0; i < 11 && !tryRateStatuses.includes(429); i += 1) {
     const res = await fetch(`${BASE}/api/try`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -766,7 +770,7 @@ let slug = '';
   }
   check(
     'own-key trial creation is durably rate-limited by IP',
-    tryRateStatuses[0] === 200 && tryRateStatuses[1] === 200 && tryRateStatuses[2] === 429,
+    tryRateStatuses.at(-1) === 429 && tryRateStatuses.slice(0, -1).every((status) => status === 200),
     JSON.stringify(tryRateStatuses)
   );
   const tryRateAuditDb = new Database(env.DATABASE_PATH);
