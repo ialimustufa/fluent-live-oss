@@ -168,6 +168,10 @@ function handleConnection(
         ws.send(envelope('snapshot', room.nextSeq(), snapshotForConnection(room, true)));
         room.sendToHost('presence', { viewerCount: room.viewers.size });
       } else if (payload.role === 'viewer') {
+        if (!room.audienceEnabled) {
+          ws.close(4403, 'audience disabled');
+          return;
+        }
         // Enforce the viewer cap configured for this room.
         if (!room.canAcceptViewer()) {
           ws.close(4409, 'viewer limit reached');
@@ -248,6 +252,23 @@ function handleHostMessage(
   // Audio is validated and rate-shaped on its own; throttle the control plane
   // (slides, polls, control) so a flood of those can't overwhelm the room.
   if (msg.type !== 'audio.in' && !throttle()) return;
+
+  if (
+    !room.audienceEnabled &&
+    (msg.type === 'poll.open' ||
+      msg.type === 'poll.close' ||
+      msg.type === 'poll.pin' ||
+      msg.type === 'poll.hide' ||
+      msg.type === 'poll.delete')
+  ) {
+    ws.send(
+      envelope('error', room.nextSeq(), {
+        code: 'audience_disabled',
+        message: 'polls are disabled for speaker-only sessions',
+      })
+    );
+    return;
+  }
 
   switch (msg.type) {
     case 'audio.in': {

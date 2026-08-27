@@ -11,6 +11,7 @@ SQLite stores sessions and final transcripts.
 ## Features
 
 - Shareable viewer, host, stage, and transcript views
+- Speaker-only local-output sessions for a single stage laptop
 - Live translated audio, translated captions, and source-language subtitles
 - PDF, published Google Slides, and external HTML deck support
 - Synchronized slides, polls, quizzes, reactions, and attendance analytics
@@ -65,6 +66,15 @@ WebSocket, and upload requests to the server.
 Open `http://localhost:5175/new`, enter the admin secret, create a session, and
 share the generated viewer URL. The server can boot without a Gemini key in
 development, but translation will not work.
+
+For a talk that only needs the speaker's stage laptop, choose **Speaker only**
+when creating the session. The host console becomes the stage view and keeps
+the microphone, translated captions, slide controls, and translated audio on
+that machine. Audience links, viewer sockets, polls, reactions, analytics, and
+Cloudflare audio fanout are disabled for the session. This is local output, not
+offline translation: the Fluent server and Gemini Live still need an internet
+connection. It also does not make an externally hosted deck or a previously
+shared upload URL private; speaker-only mode controls Fluent audience delivery.
 
 `better-sqlite3` is compiled for the active Node major version. After changing
 Node versions, run `npm rebuild better-sqlite3` with Node 24 active if startup

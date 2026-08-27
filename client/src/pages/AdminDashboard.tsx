@@ -199,10 +199,17 @@ function Dashboard() {
                           <span className="rounded-full bg-[var(--surface-2)] px-2 py-0.5 text-[var(--muted)] ring-1 ring-inset ring-[var(--border)]">
                             {s.slideType}
                           </span>
+                          {s.audienceEnabled === false && (
+                            <span className="rounded-full bg-info-soft px-2 py-0.5 font-semibold uppercase tracking-wide text-info ring-1 ring-inset ring-info">
+                              speaker only
+                            </span>
+                          )}
                           <span className="text-[var(--faint)]">{fmtDate(s.createdAt)}</span>
-                          <span className="inline-flex items-center gap-1 text-[var(--faint)]">
-                            <Users size={12} /> {s.attendeeCount} joined · peak {s.peakViewers}
-                          </span>
+                          {s.audienceEnabled !== false && (
+                            <span className="inline-flex items-center gap-1 text-[var(--faint)]">
+                              <Users size={12} /> {s.attendeeCount} joined · peak {s.peakViewers}
+                            </span>
+                          )}
                         </div>
                       </div>
                     </div>
@@ -211,9 +218,11 @@ function Dashboard() {
                       <Link to={`/${s.slug}/host`} className="btn-ghost rounded-lg px-3 py-1.5 text-xs">
                         Host
                       </Link>
-                      <Link to={`/${s.slug}`} className="btn-ghost rounded-lg px-3 py-1.5 text-xs">
-                        Viewer
-                      </Link>
+                      {s.audienceEnabled !== false && (
+                        <Link to={`/${s.slug}`} className="btn-ghost rounded-lg px-3 py-1.5 text-xs">
+                          Viewer
+                        </Link>
+                      )}
                       <Link to={`/${s.slug}/transcript`} className="btn-ghost rounded-lg px-3 py-1.5 text-xs">
                         Transcript
                       </Link>

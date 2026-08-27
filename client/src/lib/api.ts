@@ -10,10 +10,16 @@ export interface SessionInfo {
   startedAt: string | null;
   endedAt: string | null;
   presentationMode: 'in_person' | 'remote';
+  audienceEnabled: boolean;
   audio: {
     transport: 'sfu' | 'none';
     available: boolean;
-    reason?: 'subscription_inactive' | 'not_configured' | 'not_started' | 'publish_failed';
+    reason?:
+      | 'audience_disabled'
+      | 'subscription_inactive'
+      | 'not_configured'
+      | 'not_started'
+      | 'publish_failed';
   };
 }
 
@@ -62,8 +68,12 @@ export interface PollResult {
   correctOptions: number[];
 }
 
-export async function fetchPolls(slug: string): Promise<PollResult[]> {
-  const res = await fetch(`/api/sessions/${slug}/polls`);
+function bearerHeaders(auth?: string): HeadersInit | undefined {
+  return auth ? { Authorization: `Bearer ${auth}` } : undefined;
+}
+
+export async function fetchPolls(slug: string, auth?: string): Promise<PollResult[]> {
+  const res = await fetch(`/api/sessions/${slug}/polls`, { headers: bearerHeaders(auth) });
   if (!res.ok) return [];
   const body = await res.json();
   return body.polls ?? [];
@@ -71,15 +81,33 @@ export async function fetchPolls(slug: string): Promise<PollResult[]> {
 
 export const REACTION_EMOJIS = ['👍', '❤️', '🎉', '👏', '😮', '😂'] as const;
 
-export async function fetchSession(slug: string): Promise<SessionInfo> {
-  const res = await fetch(`/api/sessions/${slug}`);
-  if (!res.ok) throw new Error(`session not found (${res.status})`);
+export async function fetchSession(slug: string, auth?: string): Promise<SessionInfo> {
+  const res = await fetch(`/api/sessions/${slug}`, { headers: bearerHeaders(auth) });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+    const error = new Error(body.error ?? `HTTP ${res.status}`) as Error & {
+      code?: string;
+      status?: number;
+    };
+    error.code = body.code;
+    error.status = res.status;
+    throw error;
+  }
   return res.json();
 }
 
-export async function fetchTranscript(slug: string): Promise<TranscriptData> {
-  const res = await fetch(`/api/sessions/${slug}/transcript`);
-  if (!res.ok) throw new Error(`transcript not found (${res.status})`);
+export async function fetchTranscript(slug: string, auth?: string): Promise<TranscriptData> {
+  const res = await fetch(`/api/sessions/${slug}/transcript`, { headers: bearerHeaders(auth) });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({ error: `transcript not found (${res.status})` }));
+    const error = new Error(body.error ?? `transcript not found (${res.status})`) as Error & {
+      code?: string;
+      status?: number;
+    };
+    error.code = body.code;
+    error.status = res.status;
+    throw error;
+  }
   return res.json();
 }
 
@@ -123,6 +151,7 @@ export interface SessionListItem {
   attendeeCount: number;
   liveViewers: number;
   presentationMode: 'in_person' | 'remote';
+  audienceEnabled: boolean;
 }
 
 export async function listSessions(adminKey: string): Promise<SessionListItem[]> {
@@ -182,7 +211,7 @@ export async function subscribeAudio(
 export async function createSession(
   adminKey: string,
   form: FormData
-): Promise<{ slug: string; viewerPath: string; hostPath: string }> {
+): Promise<{ slug: string; viewerPath: string; hostPath: string; audienceEnabled: boolean }> {
   const res = await fetch('/api/sessions', {
     method: 'POST',
     headers: { Authorization: `Bearer ${adminKey}` },

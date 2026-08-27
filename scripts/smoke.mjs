@@ -303,9 +303,101 @@ const MINI_PDF = makePdf();
 
 fs.rmSync(DATA, { recursive: true, force: true });
 
-// ---- Test 0: SFU packet framing carries correct real-time durations
+// ---- Test 0: additive migration preserves existing sessions as audience-enabled
+console.log('\n[0] Legacy database migration');
+{
+  fs.mkdirSync(DATA, { recursive: true });
+  const legacyPath = path.join(DATA, 'legacy-migration.db');
+  const legacy = new Database(legacyPath);
+  legacy.exec(`
+    CREATE TABLE sessions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      slug TEXT NOT NULL UNIQUE,
+      title TEXT NOT NULL DEFAULT '',
+      target_lang TEXT NOT NULL,
+      slide_type TEXT NOT NULL,
+      slide_ref TEXT NOT NULL,
+      slide_count INTEGER,
+      echo_target_language INTEGER NOT NULL DEFAULT 0,
+      state TEXT NOT NULL DEFAULT 'created',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      started_at TEXT,
+      ended_at TEXT,
+      presentation_mode TEXT NOT NULL DEFAULT 'in_person'
+    );
+    INSERT INTO sessions (slug, title, target_lang, slide_type, slide_ref)
+    VALUES ('legacy01', 'Legacy talk', 'es', 'html', 'https://example.com/legacy.html');
+  `);
+  legacy.close();
+  const { initDb } = await import(path.join(ROOT, 'server/dist/db.js'));
+  const { database: migrated } = initDb(legacyPath);
+  const migratedRow = migrated.prepare('SELECT audience_enabled FROM sessions WHERE slug = ?').get('legacy01');
+  const migratedColumns = migrated.prepare('PRAGMA table_info(sessions)').all();
+  check(
+    'audience_enabled is added with a safe backward-compatible default',
+    migratedColumns.some((column) => column.name === 'audience_enabled') && migratedRow?.audience_enabled === 1,
+    JSON.stringify({ migratedRow, columns: migratedColumns.map((column) => column.name) })
+  );
+  migrated.close();
+}
+
+// ---- Test 0a: speaker-only rooms keep translated audio on the host socket
+console.log('\n[0a] Speaker-only room fanout isolation');
+{
+  const roomDbPath = path.join(DATA, 'speaker-room.db');
+  const dbModule = await import(path.join(ROOT, 'server/dist/db.js'));
+  const { database: roomDb } = dbModule.initDb(roomDbPath);
+  const session = dbModule.createSession({
+    slug: 'localroom01',
+    title: 'Local room',
+    target_lang: 'es',
+    slide_type: 'html',
+    slide_ref: 'https://example.com/local-room.html',
+    slide_count: null,
+    echo_target_language: false,
+    presentation_mode: 'in_person',
+    audience_enabled: false,
+  });
+  const { Room, configureRooms } = await import(path.join(ROOT, 'server/dist/rooms.js'));
+  const fanoutCalls = { start: 0, publish: 0, close: 0 };
+  const fakeFanout = {
+    startSession: async () => { fanoutCalls.start += 1; },
+    publishTranslated: () => { fanoutCalls.publish += 1; },
+    close: async () => { fanoutCalls.close += 1; },
+    queueDepthMs: () => 0,
+  };
+  configureRooms('smoke-key', Infinity, fakeFanout);
+  const hostMessages = [];
+  const room = new Room(session, 'smoke-key');
+  room.host = {
+    OPEN: 1,
+    readyState: 1,
+    bufferedAmount: 0,
+    send: (message) => hostMessages.push(JSON.parse(String(message))),
+    close: () => {},
+  };
+  const bridgeWithEvents = room.createBridge();
+  room.createBridge = () => ({ start: async () => {}, close: () => {} });
+  room.start();
+  bridgeWithEvents.events.onAudio('AA==');
+  room.stop();
+  await new Promise((resolve) => setImmediate(resolve));
+  check(
+    'speaker-only room skips SFU lifecycle while translated audio reaches the host',
+    fanoutCalls.start === 0 &&
+      fanoutCalls.publish === 0 &&
+      fanoutCalls.close === 0 &&
+      hostMessages.some((message) => message.type === 'audio.out' && message.payload?.data === 'AA=='),
+    JSON.stringify({ fanoutCalls, hostMessages })
+  );
+  bridgeWithEvents.close();
+  configureRooms('', Infinity, null);
+  roomDb.close();
+}
+
+// ---- Test 0b: SFU packet framing carries correct real-time durations
 // (the pacer feeds the SFU at 1× using these durations, so they must be exact).
-console.log('\n[0] SFU audio packet pacing math');
+console.log('\n[0b] SFU audio packet pacing math');
 {
   const { pcm24kMonoBase64ToSfuFrames, decodeSfuPacket } = await import(
     path.join(ROOT, 'server/dist/audio-packet.js')
@@ -1433,6 +1525,7 @@ await waitForHealth();
 // ---- Test 8: create a session with a PDF (criterion #1, server side)
 console.log('\n[8] Session creation with PDF upload');
 let slug = '';
+let speakerSlug = '';
 {
   const form = new FormData();
   form.set('title', 'Smoke Talk');
@@ -1564,6 +1657,81 @@ let slug = '';
   const langs = await (await fetch(`${BASE}/api/languages`)).json();
   check('language table has 70+ entries', Array.isArray(langs) && langs.length >= 70, `(got ${langs.length})`);
 
+  const speakerOnlyRes = await fetch(`${BASE}/api/sessions`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${SECRET}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      title: 'Speaker-only Stage',
+      targetLang: 'es',
+      // The server owns this invariant: a client cannot create a remote
+      // speaker-only session even if it submits contradictory JSON directly.
+      presentationMode: 'remote',
+      audienceEnabled: false,
+      slideType: 'html',
+      slideUrl: 'https://example.com/speaker-stage.html',
+    }),
+  });
+  const speakerOnlyBody = await speakerOnlyRes.json();
+  speakerSlug = speakerOnlyBody.slug ?? '';
+  const speakerOnlyInfoRes = await fetch(`${BASE}/api/sessions/${speakerSlug}`, {
+    headers: { Authorization: `Bearer ${SECRET}` },
+  });
+  const speakerOnlyInfo = await speakerOnlyInfoRes.json();
+  check(
+    'speaker-only creation persists disabled audience delivery',
+    speakerOnlyRes.ok &&
+      speakerOnlyBody.audienceEnabled === false &&
+      speakerOnlyInfoRes.ok &&
+      speakerOnlyInfo.audienceEnabled === false &&
+      speakerOnlyInfo.presentationMode === 'in_person',
+    JSON.stringify({ body: speakerOnlyBody, info: speakerOnlyInfo })
+  );
+  const publicSpeakerInfo = await fetch(`${BASE}/api/sessions/${speakerSlug}`);
+  const publicSpeakerInfoBody = await publicSpeakerInfo.json();
+  const publicSpeakerTranscript = await fetch(`${BASE}/api/sessions/${speakerSlug}/transcript`);
+  const publicSpeakerPolls = await fetch(`${BASE}/api/sessions/${speakerSlug}/polls`);
+  check(
+    'speaker-only public metadata is content-free and transcript/polls require operator auth',
+    publicSpeakerInfo.ok &&
+      publicSpeakerInfoBody.audienceEnabled === false &&
+      publicSpeakerInfoBody.title === 'Speaker-only session' &&
+      publicSpeakerInfoBody.slideUrl === '' &&
+      publicSpeakerTranscript.status === 403 &&
+      publicSpeakerPolls.status === 403,
+    JSON.stringify({
+      info: publicSpeakerInfo.status,
+      transcript: publicSpeakerTranscript.status,
+      polls: publicSpeakerPolls.status,
+      body: publicSpeakerInfoBody,
+    })
+  );
+  check(
+    'speaker-only session reports no audience audio transport',
+    speakerOnlyInfo.audio?.available === false &&
+      speakerOnlyInfo.audio?.transport === 'none' &&
+      speakerOnlyInfo.audio?.reason === 'audience_disabled',
+    JSON.stringify(speakerOnlyInfo.audio)
+  );
+  const speakerAudioSub = await fetch(`${BASE}/api/sessions/${speakerSlug}/audio/subscribe`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sessionDescription: { type: 'offer', sdp: 'v=0\r\n' } }),
+  });
+  const speakerAudioSubBody = await speakerAudioSub.json();
+  check(
+    'speaker-only session rejects audience audio subscription',
+    speakerAudioSub.status === 403 && speakerAudioSubBody.code === 'audience_disabled',
+    `(status ${speakerAudioSub.status}, body ${JSON.stringify(speakerAudioSubBody)})`
+  );
+  const sessionsList = await (
+    await fetch(`${BASE}/api/sessions`, { headers: { Authorization: `Bearer ${SECRET}` } })
+  ).json();
+  check(
+    'admin session list identifies speaker-only sessions',
+    sessionsList.find((session) => session.slug === speakerSlug)?.audienceEnabled === false,
+    JSON.stringify(sessionsList.find((session) => session.slug === speakerSlug))
+  );
+
   const htmlUpload = new FormData();
   htmlUpload.set('title', 'Bad HTML Upload');
   htmlUpload.set('targetLang', 'es');
@@ -1676,6 +1844,38 @@ let slug = '';
 // ---- Test 9: WS auth + read-only viewers (criterion #7)
 console.log('\n[9] WebSocket roles');
 {
+  const speakerViewer = await wsOpen(speakerSlug, { role: 'viewer', viewerId: 'not-admitted' });
+  check(
+    'speaker-only session rejects viewer sockets',
+    speakerViewer.closeCode() === 4403,
+    `(close ${speakerViewer.closeCode()})`
+  );
+  const speakerHost = await wsOpen(speakerSlug, { role: 'host', auth: SECRET });
+  check(
+    'speaker-only host still receives a room snapshot',
+    speakerHost.messages.some((message) => message.type === 'snapshot')
+  );
+  speakerHost.ws.send(JSON.stringify({
+    type: 'poll.open',
+    ts: 0,
+    seq: 0,
+    payload: { question: 'This must not persist', options: ['A', 'B'] },
+  }));
+  await new Promise((r) => setTimeout(r, 200));
+  const speakerPollsRes = await fetch(`${BASE}/api/sessions/${speakerSlug}/polls`, {
+    headers: { Authorization: `Bearer ${SECRET}` },
+  });
+  const speakerPollsBody = await speakerPollsRes.json();
+  check(
+    'speaker-only host poll commands are rejected without persistence',
+    speakerHost.messages.some(
+      (message) => message.type === 'error' && message.payload?.code === 'audience_disabled'
+    ) && speakerPollsBody.polls?.length === 0,
+    JSON.stringify({ messages: speakerHost.messages, polls: speakerPollsBody })
+  );
+  speakerViewer.ws.close();
+  speakerHost.ws.close();
+
   const viewer = await wsOpen(slug, { role: 'viewer' });
   const snap = viewer.messages.find((m) => m.type === 'snapshot');
   check(
@@ -1812,6 +2012,16 @@ await waitForHealth();
     'session survives a server restart',
     res.ok && info.slug === slug && info.title === 'Smoke Talk',
     `(status ${res.status}, body ${JSON.stringify(info)}, slug ${slug})`
+  );
+  const speakerInfo = await (
+    await fetch(`${BASE}/api/sessions/${speakerSlug}`, {
+      headers: { Authorization: `Bearer ${SECRET}` },
+    })
+  ).json();
+  check(
+    'speaker-only delivery flag survives a server restart',
+    speakerInfo.slug === speakerSlug && speakerInfo.audienceEnabled === false,
+    JSON.stringify(speakerInfo)
   );
   const tr = await (await fetch(`${BASE}/api/sessions/${slug}/transcript`)).json();
   check('transcript endpoint is publicly readable', Array.isArray(tr.segments), JSON.stringify(tr));

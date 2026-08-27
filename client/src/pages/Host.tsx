@@ -4,7 +4,7 @@ import { Link, useParams } from 'react-router-dom';
 import {
   Play, Pause, Square, RotateCw, ChevronLeft, ChevronRight, Users, Circle,
   MonitorPlay, PictureInPicture2, X, Check, Plus, Volume2, Headphones, Smartphone,
-  Mic, MicOff,
+  Mic, MicOff, Laptop2,
 } from 'lucide-react';
 
 type Routing = 'room' | 'headphones' | 'viewers';
@@ -121,6 +121,8 @@ function HostInner() {
   const hostReady = hasSession && !hostAuthRejected;
 
   const sockRef = useRef<SessionSocket | null>(null);
+  const sessionRef = useRef(session);
+  sessionRef.current = session;
   const micRef = useRef<MicCapture | null>(null);
   const micIdRef = useRef(micId);
   micIdRef.current = micId;
@@ -173,7 +175,7 @@ function HostInner() {
     let active = true;
     setSession(null);
     setSessionNotFound(false);
-    void fetchSession(slug)
+    void fetchSession(slug, auth)
       .then((s) => {
         if (!active) return;
         setSession(s);
@@ -186,7 +188,7 @@ function HostInner() {
     return () => {
       active = false;
     };
-  }, [slug]);
+  }, [auth, slug]);
 
   // Enumerating devices can expose permission UI in some browsers. Do not do
   // any device work until the requested session has been confirmed to exist.
@@ -543,7 +545,13 @@ function HostInner() {
   //   viewers    → host silent; audio is per-device (neither)
   // `ensurePlayer` is false on the initial auto-select (the output player is
   // enabled at Start, as before) and true when the host picks during setup.
-  const applyRouting = async (r: Routing, ensurePlayer = true) => {
+  const applyRouting = async (requested: Routing, ensurePlayer = true) => {
+    // Speaker-only sessions never have a viewer-audio route. Keep this guard in
+    // the controller as well as the UI so a stale callback cannot silence the
+    // only translated output on stage.
+    const r = requested === 'viewers' && sessionRef.current?.audienceEnabled === false
+      ? 'room'
+      : requested;
     setRouting(r);
     setRoomMode(r === 'room');
     setMonitor(r === 'headphones');
@@ -605,6 +613,7 @@ function HostInner() {
   // Attendance analytics is intentionally low-frequency; live viewer count is
   // already provided over the host websocket.
   const refreshAnalytics = useCallback(async () => {
+    if (sessionRef.current?.audienceEnabled === false) return;
     if (!hostReady || analyticsRefreshInFlightRef.current) return;
     analyticsRefreshInFlightRef.current = true;
     setAnalyticsRefreshing(true);
@@ -620,11 +629,11 @@ function HostInner() {
   }, [slug, auth, hostReady]);
 
   useEffect(() => {
-    if (!hostReady) return;
+    if (!hostReady || !session?.audienceEnabled) return;
     void refreshAnalytics();
     const id = window.setInterval(() => void refreshAnalytics(), ANALYTICS_REFRESH_MS);
     return () => clearInterval(id);
-  }, [hostReady, refreshAnalytics]);
+  }, [hostReady, refreshAnalytics, session?.audienceEnabled]);
 
   // We route monitor/PA audio through a media element, so element setSinkId
   // counts too (broader support than AudioContext.setSinkId).
@@ -690,9 +699,17 @@ function HostInner() {
             : 'bg-[var(--surface-2)] text-[var(--muted)] ring-[var(--border)]';
 
   return (
-    <div className="flex h-screen bg-[var(--bg)]">
+    <div
+      className={`flex h-screen bg-[var(--bg)] ${
+        session.audienceEnabled ? '' : 'flex-col md:flex-row'
+      }`}
+    >
       {/* Main column: same layout as viewer */}
-      <div className="hidden min-w-0 flex-1 flex-col md:flex">
+      <div
+        className={`${
+          session.audienceEnabled ? 'hidden md:flex' : 'flex min-h-[40vh]'
+        } min-w-0 flex-1 flex-col`}
+      >
         <TranscriptBar lines={output.lines} label={session.targetLang} position="top" accent size="lg" />
         <div className="relative min-h-0 flex-1 bg-[var(--surface-2)]">
           <SlideViewer
@@ -711,13 +728,17 @@ function HostInner() {
               <span className="h-2 w-2 rounded-full bg-error" /> {translationError}
             </div>
           )}
-          <ReactionLayer items={reactions.items} />
+          {session.audienceEnabled && <ReactionLayer items={reactions.items} />}
         </div>
         <TranscriptBar lines={input.lines} label="EN" position="bottom" size="sm" />
       </div>
 
       {/* Control rail: pinned live-critical band + tabbed body */}
-      <aside className="glass-panel flex w-full shrink-0 flex-col text-[var(--fg)] md:w-[22rem] md:border-l md:border-[var(--border)]">
+      <aside
+        className={`glass-panel flex w-full shrink-0 flex-col text-[var(--fg)] md:w-[22rem] md:border-l md:border-[var(--border)] ${
+          session.audienceEnabled ? '' : 'min-h-0 flex-1 md:flex-none'
+        }`}
+      >
         {/* 1) Pinned band — transport + slide nav stay visible without scrolling */}
         <div className="shrink-0 space-y-3 border-b border-[var(--border)] p-4">
           <div className="flex items-start justify-between gap-2">
@@ -726,6 +747,11 @@ function HostInner() {
           </div>
           <div className="space-y-3">
             <div className="flex flex-wrap items-center gap-1.5 text-xs">
+              {!session.audienceEnabled && (
+                <span className="flex items-center gap-1.5 rounded-full bg-info-soft px-2.5 py-1 font-semibold uppercase tracking-wide text-info ring-1 ring-inset ring-info">
+                  <Laptop2 size={13} /> Speaker only
+                </span>
+              )}
               <span className={`flex items-center gap-1.5 rounded-full px-2.5 py-1 font-semibold uppercase tracking-wide ring-1 ring-inset ${stateStyle}`}>
                 {state === 'live' && <span className="live-dot" />}
                 <span className={state === 'live' ? 'grad-text' : undefined}>{state}</span>
@@ -737,9 +763,11 @@ function HostInner() {
                 <Circle size={8} className={wsConnected ? 'fill-current text-[var(--cyan)]' : 'fill-current text-[var(--faint)]'} />
                 {wsConnected ? 'live' : 'offline'}
               </span>
-              <span className="flex items-center gap-1 rounded-full bg-[var(--surface-2)] px-2.5 py-1 text-[var(--muted)] ring-1 ring-inset ring-[var(--border)]">
-                <Users size={13} /> {viewerCount}
-              </span>
+              {session.audienceEnabled && (
+                <span className="flex items-center gap-1 rounded-full bg-[var(--surface-2)] px-2.5 py-1 text-[var(--muted)] ring-1 ring-inset ring-[var(--border)]">
+                  <Users size={13} /> {viewerCount}
+                </span>
+              )}
             </div>
 
             {/* Transport */}
@@ -813,7 +841,10 @@ function HostInner() {
 
         {/* 2) Tabs */}
         <div className="flex shrink-0 gap-4 border-b border-[var(--border)] px-4">
-          {(['setup', 'polls', 'audience'] as const).map((t) => (
+          {(session.audienceEnabled
+            ? (['setup', 'polls', 'audience'] as const)
+            : (['setup'] as const)
+          ).map((t) => (
             <button
               key={t}
               onClick={() => setConsoleTab(t)}
@@ -831,6 +862,17 @@ function HostInner() {
         <div className="flex-1 overflow-y-auto p-4">
           {tab === 'setup' && (
             <div className="space-y-4">
+              {!session.audienceEnabled && (
+                <div className="rounded-[var(--r-lg)] bg-info-soft p-3.5 text-sm text-info ring-1 ring-inset ring-info">
+                  <p className="flex items-center gap-2 font-semibold">
+                    <Laptop2 size={17} /> Local stage output
+                  </p>
+                  <p className="mt-1.5 leading-relaxed">
+                    Audience delivery is off. Translated audio plays only from this stage device;
+                    the Fluent server and Gemini still require an internet connection.
+                  </p>
+                </div>
+              )}
         {/* Microphone + one guided routing choice (collapses once live since it
             is configured pre-talk; advanced options behind a disclosure). */}
         <details open={state !== 'live'} className="rounded-[var(--r-lg)] bg-[var(--surface-2)] p-3.5 ring-1 ring-inset ring-[var(--border)]">
@@ -875,7 +917,9 @@ function HostInner() {
                 { value: 'room', Icon: Volume2, label: 'Room speakers', hint: 'Through this machine · echo auto-cancelled' },
                 { value: 'headphones', Icon: Headphones, label: 'My headphones', hint: 'Monitor privately — no feedback risk' },
                 { value: 'viewers', Icon: Smartphone, label: "Viewers' phones only", hint: 'Captions + slides here · audio per device' },
-              ] as const).map(({ value, Icon, label, hint }) => (
+              ] as const)
+                .filter(({ value }) => session.audienceEnabled || value !== 'viewers')
+                .map(({ value, Icon, label, hint }) => (
                 <button
                   key={value}
                   type="button"
@@ -893,7 +937,7 @@ function HostInner() {
                     <span className="block text-[11px] leading-snug text-[var(--faint)]">{hint}</span>
                   </span>
                 </button>
-              ))}
+                ))}
             </fieldset>
 
             {/* Advanced — output device, half-duplex, browser DSP, warnings */}
@@ -976,42 +1020,64 @@ function HostInner() {
           </div>
         </details>
 
-        {/* Share */}
+        {/* Share / local-stage tools */}
         <div className="space-y-3">
-          <label className="text-xs font-semibold uppercase tracking-wide text-[var(--faint)]">Audience link</label>
-          <div className="flex justify-center">
-            <QrCode url={viewerUrl} size={156} />
-          </div>
-          <div className="flex gap-2">
-            <input readOnly value={viewerUrl} className="input-field min-w-0 flex-1 px-2.5 py-1.5 text-xs text-[var(--muted)]" />
-            <button
-              onClick={() => void navigator.clipboard.writeText(viewerUrl)}
-              className="btn-ghost rounded-lg px-3 py-1.5 text-xs"
-            >
-              Copy
-            </button>
-          </div>
-          <div className="flex gap-2">
-            <a
-              href={`/${slug}/present`}
-              target="_blank"
-              rel="noreferrer"
-              className="btn-ghost flex flex-1 items-center justify-center gap-1.5 rounded-[var(--r-md)] px-3 py-2 text-center text-xs"
-              title="Open the display-only projector view; control slides from this host console"
-            >
-              <MonitorPlay size={15} /> Project (display-only)
-            </a>
-            {pip.supported && (
-              <button
-                onClick={() => (pip.isOpen ? pip.close() : void pip.open())}
-                className="btn-ghost flex flex-1 items-center justify-center gap-1.5 rounded-[var(--r-md)] px-3 py-2 text-xs"
-                title="Float captions over your other apps (Chrome/Edge)"
-              >
-                {pip.isOpen ? <X size={15} /> : <PictureInPicture2 size={15} />}
-                {pip.isOpen ? 'Captions' : 'Pop out captions'}
-              </button>
-            )}
-          </div>
+          {session.audienceEnabled ? (
+            <>
+              <label className="text-xs font-semibold uppercase tracking-wide text-[var(--faint)]">Audience link</label>
+              <div className="flex justify-center">
+                <QrCode url={viewerUrl} size={156} />
+              </div>
+              <div className="flex gap-2">
+                <input readOnly value={viewerUrl} className="input-field min-w-0 flex-1 px-2.5 py-1.5 text-xs text-[var(--muted)]" />
+                <button
+                  onClick={() => void navigator.clipboard.writeText(viewerUrl)}
+                  className="btn-ghost rounded-lg px-3 py-1.5 text-xs"
+                >
+                  Copy
+                </button>
+              </div>
+              <div className="flex gap-2">
+                <a
+                  href={`/${slug}/present`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="btn-ghost flex flex-1 items-center justify-center gap-1.5 rounded-[var(--r-md)] px-3 py-2 text-center text-xs"
+                  title="Open the display-only projector view; control slides from this host console"
+                >
+                  <MonitorPlay size={15} /> Project (display-only)
+                </a>
+                {pip.supported && (
+                  <button
+                    onClick={() => (pip.isOpen ? pip.close() : void pip.open())}
+                    className="btn-ghost flex flex-1 items-center justify-center gap-1.5 rounded-[var(--r-md)] px-3 py-2 text-xs"
+                    title="Float captions over your other apps (Chrome/Edge)"
+                  >
+                    {pip.isOpen ? <X size={15} /> : <PictureInPicture2 size={15} />}
+                    {pip.isOpen ? 'Captions' : 'Pop out captions'}
+                  </button>
+                )}
+              </div>
+            </>
+          ) : (
+            <>
+              <label className="text-xs font-semibold uppercase tracking-wide text-[var(--faint)]">Speaker tools</label>
+              <p className="rounded-[var(--r-md)] bg-[var(--surface-2)] px-3 py-2 text-xs leading-relaxed text-[var(--muted)] ring-1 ring-inset ring-[var(--border)]">
+                Keep this console open while speaking: it owns the microphone, local audio, captions,
+                and slide controls. Viewer connections are disabled.
+              </p>
+              {pip.supported && (
+                <button
+                  onClick={() => (pip.isOpen ? pip.close() : void pip.open())}
+                  className="btn-ghost flex w-full items-center justify-center gap-1.5 rounded-[var(--r-md)] px-3 py-2 text-xs"
+                  title="Float captions over your other apps (Chrome/Edge)"
+                >
+                  {pip.isOpen ? <X size={15} /> : <PictureInPicture2 size={15} />}
+                  {pip.isOpen ? 'Close floating captions' : 'Pop out captions'}
+                </button>
+              )}
+            </>
+          )}
         </div>
 
             </div>

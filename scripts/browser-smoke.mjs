@@ -110,10 +110,11 @@ async function waitForHealth(timeoutMs = 10000) {
   return false;
 }
 
-async function createPdfSession(title = 'Browser Smoke PDF') {
+async function createPdfSession(title = 'Browser Smoke PDF', { audienceEnabled = true } = {}) {
   const form = new FormData();
   form.set('title', title);
   form.set('targetLang', 'es');
+  form.set('audienceEnabled', String(audienceEnabled));
   form.set('slideType', 'pdf');
   form.set('file', new File([makePdf()], 'browser-smoke.pdf', { type: 'application/pdf' }));
   const res = await fetch(`${BASE}/api/sessions`, {
@@ -276,6 +277,7 @@ let browser;
 try {
   check('bootstrap server health is ready', await waitForHealth());
   const created = await createPdfSession();
+  const speakerCreated = await createPdfSession('Browser Smoke Speaker Stage', { audienceEnabled: false });
   await stopServer(server);
 
   server = startServer();
@@ -659,6 +661,81 @@ try {
     'attendance refresh button fetches analytics once',
     hostAnalyticsRequests.length === beforeManualRefresh + 1,
     hostAnalyticsRequests.join('\n')
+  );
+
+  const beforeSpeakerHostAnalytics = hostAnalyticsRequests.length;
+  let speakerHostSocketSeen = false;
+  let speakerHostSocketClosed = false;
+  page.on('websocket', (socket) => {
+    if (new URL(socket.url()).pathname !== `/ws/${speakerCreated.slug}`) return;
+    speakerHostSocketSeen = true;
+    socket.on('close', () => {
+      speakerHostSocketClosed = true;
+    });
+  });
+  await page.goto(`${BASE}${speakerCreated.hostPath}`, { waitUntil: 'domcontentloaded' });
+  await page.getByText('Speaker only', { exact: true }).waitFor({ timeout: 15000 });
+  await page.getByText('live', { exact: true }).waitFor({ timeout: 5000 });
+  await page.waitForTimeout(250);
+  check(
+    'speaker-only host renders local stage controls without audience UI',
+    (await page.getByText('Local stage output', { exact: true }).isVisible()) &&
+      (await page.getByRole('button', { name: /^Polls$/i }).count()) === 0 &&
+      (await page.getByRole('button', { name: /^Analytics$/i }).count()) === 0 &&
+      (await page.getByText('Audience link', { exact: true }).count()) === 0 &&
+      (await page.getByText("Viewers' phones only", { exact: true }).count()) === 0
+  );
+  check(
+    'speaker-only host does not request attendance analytics',
+    hostAnalyticsRequests.length === beforeSpeakerHostAnalytics,
+    hostAnalyticsRequests.slice(beforeSpeakerHostAnalytics).join('\n')
+  );
+
+  await page.setViewportSize({ width: 700, height: 900 });
+  await page.locator('canvas').first().waitFor({ state: 'visible', timeout: 10000 });
+  check(
+    'speaker-only host keeps its slide deck visible below the md breakpoint',
+    await page.locator('canvas').first().isVisible()
+  );
+
+  const speakerPresentPage = await browser.newPage();
+  attachDiagnostics(speakerPresentPage, 'speaker-present');
+  const speakerPresentSockets = [];
+  speakerPresentPage.on('websocket', (socket) => speakerPresentSockets.push(socket.url()));
+  await speakerPresentPage.goto(`${BASE}/${speakerCreated.slug}/present`, {
+    waitUntil: 'domcontentloaded',
+  });
+  await speakerPresentPage
+    .getByRole('heading', { name: /no projector for this speaker-only session/i })
+    .waitFor({ timeout: 5000 });
+  await speakerPresentPage.waitForTimeout(500);
+  check(
+    'speaker-only projector route is a socket-free notice and leaves the stage host connected',
+    new URL(speakerPresentPage.url()).pathname === `/${speakerCreated.slug}/present` &&
+      speakerPresentSockets.length === 0 &&
+      speakerHostSocketSeen &&
+      !speakerHostSocketClosed &&
+      (await page.getByText('live', { exact: true }).isVisible()),
+    JSON.stringify({ speakerPresentSockets, speakerHostSocketSeen, speakerHostSocketClosed })
+  );
+
+  await speakerPresentPage.goto(`${BASE}/${speakerCreated.slug}/transcript`, {
+    waitUntil: 'domcontentloaded',
+  });
+  await speakerPresentPage
+    .getByRole('heading', { name: 'Presenter access', exact: true })
+    .waitFor({ timeout: 5000 });
+  check(
+    'speaker-only transcript prompts for the presenter key',
+    await speakerPresentPage.getByRole('heading', { name: 'Presenter access', exact: true }).isVisible()
+  );
+  await speakerPresentPage.close();
+
+  await page.goto(`${BASE}/${speakerCreated.slug}`, { waitUntil: 'domcontentloaded' });
+  await page.getByRole('heading', { name: /speaker-only session/i }).waitFor({ timeout: 5000 });
+  check(
+    'speaker-only viewer route stops before onboarding',
+    (await page.getByRole('button', { name: /Enter the room/i }).count()) === 0
   );
 
   await endSession(created.slug);
