@@ -1,11 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { useParams } from 'react-router-dom';
+import { Link, useParams } from 'react-router-dom';
 import { MessageSquare, X, BarChart3, ChevronLeft, ChevronRight } from 'lucide-react';
 import { fetchSession, type SessionInfo } from '../lib/api';
-import { SessionSocket } from '../lib/ws';
+import { SessionSocket, type SessionSnapshotPayload } from '../lib/ws';
 import { getAdminKey } from '../lib/adminKey';
-import { getTrialHostToken } from '../lib/trial';
 import { useTranscriptLines } from '../lib/useTranscripts';
 import { useCaptionPip } from '../lib/captionPip';
 import { usePoll } from '../lib/usePoll';
@@ -32,6 +31,12 @@ export default function Present() {
   const [state, setState] = useState('created');
   const [slideIndex, setSlideIndex] = useState(0);
   const [slideCount, setSlideCount] = useState<number | null>(null);
+  const [canPresent, setCanPresent] = useState(false);
+  const [authorizationResolved, setAuthorizationResolved] = useState(false);
+  const [connectionStatus, setConnectionStatus] = useState<
+    'connecting' | 'authorizing' | 'connected' | 'reconnecting' | 'failed'
+  >('connecting');
+  const [connectionError, setConnectionError] = useState<string | null>(null);
   const output = useTranscriptLines();
   const pip = useCaptionPip();
   const poll = usePoll(10_000); // closed polls auto-hide after 10s unless pinned
@@ -40,10 +45,9 @@ export default function Present() {
   const sockRef = useRef<SessionSocket | null>(null);
 
   const viewerUrl = `${location.origin}/${slug}`;
-  // The presenter's token (trial host token, else stored admin key) lets this
-  // stage drive slides. Absent it, the page is a read-only display.
-  const auth = getTrialHostToken(slug) ?? getAdminKey() ?? '';
-  const canPresent = !!auth;
+  // A stored key is only a credential to present to the server. The snapshot's
+  // connection-scoped canPresent bit is the sole authority for slide controls.
+  const auth = getAdminKey() ?? '';
 
   useEffect(() => {
     fetchSession(slug)
@@ -57,19 +61,42 @@ export default function Present() {
 
   useEffect(() => {
     if (!session) return;
+    let active = true;
+    setCanPresent(false);
+    setAuthorizationResolved(false);
+    setConnectionError(null);
+    setConnectionStatus('connecting');
     const sock = new SessionSocket(slug, 'viewer', auth || undefined);
     sockRef.current = sock;
+    sock.onStatusChange = (connected) => {
+      if (!active) return;
+      // Opening a transport is not authorization. Hide controls until the next
+      // snapshot explicitly grants them, including after every reconnect.
+      setCanPresent(false);
+      setAuthorizationResolved(false);
+      setConnectionStatus(connected ? 'authorizing' : 'reconnecting');
+    };
+    sock.onGaveUp = (code) => {
+      if (!active) return;
+      setCanPresent(false);
+      setAuthorizationResolved(false);
+      setConnectionStatus('failed');
+      setConnectionError(
+        code === 4429
+          ? 'Stage connection rate-limited. Wait a minute, then reload.'
+          : 'Stage connection lost. Reload this page.'
+      );
+    };
     sock.onMessage = (msg) => {
       switch (msg.type) {
         case 'snapshot': {
-          const p = msg.payload as {
-            state: string;
-            slideIndex: number;
-            recentTranscripts: { kind: string; text: string }[];
-            activePoll: LivePoll | null;
-          };
+          const p = msg.payload as SessionSnapshotPayload;
           setState(p.state);
           setSlideIndex(p.slideIndex);
+          setCanPresent(p.canPresent === true);
+          setAuthorizationResolved(true);
+          setConnectionStatus('connected');
+          setConnectionError(null);
           output.seed(p.recentTranscripts.filter((t) => t.kind === 'output').map((t) => t.text));
           poll.apply(p.activePoll ?? null);
           break;
@@ -95,11 +122,12 @@ export default function Present() {
     };
     sock.connect();
     return () => {
+      active = false;
       sock.close();
       sockRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [session, slug]);
+  }, [auth, session, slug]);
 
   // Drive slides (optimistic local move + broadcast so viewers/host follow).
   const changeSlide = (delta: number) => {
@@ -133,6 +161,18 @@ export default function Present() {
 
   const atStart = slideIndex <= 0;
   const atEnd = slideCount !== null && slideIndex >= slideCount - 1;
+  const connectionLabel =
+    connectionStatus === 'connecting'
+      ? 'Connecting to stage…'
+      : connectionStatus === 'authorizing'
+        ? 'Checking stage access…'
+        : connectionStatus === 'reconnecting'
+          ? 'Reconnecting to stage…'
+          : connectionStatus === 'failed'
+            ? connectionError ?? 'Stage connection lost.'
+            : canPresent
+              ? 'Presenter controls connected'
+              : 'Display-only stage';
 
   return (
     <div className="bg-aurora flex h-[100dvh] flex-col">
@@ -183,6 +223,11 @@ export default function Present() {
               `Waiting · ${session.targetLang}`
             )}
           </div>
+          <div
+            className={`text-[11px] ${connectionStatus === 'failed' ? 'text-error' : 'text-[var(--faint)]'}`}
+          >
+            {connectionLabel}
+          </div>
         </div>
       </header>
 
@@ -198,6 +243,29 @@ export default function Present() {
         {state === 'created' && (
           <div className="pointer-events-none absolute inset-0 flex items-center justify-center text-xl text-[var(--muted)]">
             Waiting for the presenter to start…
+          </div>
+        )}
+
+        {authorizationResolved && auth && !canPresent && (
+          <div
+            role="status"
+            className="glass absolute inset-x-0 top-4 mx-auto flex w-fit max-w-[90%] items-center gap-3 rounded-full px-4 py-2 text-sm font-medium text-warning"
+          >
+            <span>Presenter key rejected; stage is read-only.</span>
+            <Link to="/new" className="underline underline-offset-2 hover:text-[var(--fg)]">
+              Presenter access
+            </Link>
+          </div>
+        )}
+
+        {(connectionStatus === 'reconnecting' || connectionStatus === 'failed') && (
+          <div
+            role="status"
+            className={`glass absolute inset-x-0 top-4 mx-auto w-fit max-w-[90%] rounded-full px-4 py-2 text-sm font-medium ${
+              connectionStatus === 'failed' ? 'text-error' : 'text-warning'
+            }`}
+          >
+            {connectionLabel}
           </div>
         )}
 

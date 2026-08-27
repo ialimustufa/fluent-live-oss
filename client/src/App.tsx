@@ -1,14 +1,11 @@
 import { useEffect } from 'react';
 import { BrowserRouter, Link, Navigate, Route, Routes, useLocation, useParams } from 'react-router-dom';
-import { Sparkles } from 'lucide-react';
 import NewSession from './pages/NewSession';
 import Host from './pages/Host';
 import Viewer from './pages/Viewer';
 import TranscriptPage from './pages/TranscriptPage';
 import AdminDashboard from './pages/AdminDashboard';
-import Try from './pages/Try';
 import Present from './pages/Present';
-import Beta from './pages/Beta';
 import ThemeToggle from './components/ThemeToggle';
 import { trackRoute } from './lib/analytics';
 
@@ -46,13 +43,13 @@ function Home() {
         </p>
         <div className="mt-8 flex flex-wrap items-center justify-center gap-3">
           <Link
-            to="/beta"
+            to="/new"
             className="btn-primary flex items-center gap-2 rounded-[var(--r-lg)] px-8 py-3 text-base"
           >
-            <Sparkles size={18} /> Start beta trial
+            Presenter access
           </Link>
         </div>
-        <p className="mt-5 text-sm text-[var(--muted)]">Add your Gemini key in the trial form for longer testing.</p>
+        <p className="mt-3 text-sm text-[var(--faint)]">Presenter key required.</p>
       </div>
     </div>
   );
@@ -64,9 +61,9 @@ export default function App() {
       <AnalyticsRouteTracker />
       <Routes>
         <Route path="/" element={<Home />} />
-        <Route path="/beta" element={<Beta />} />
+        <Route path="/try" element={<Navigate replace to="/" />} />
+        <Route path="/beta" element={<Navigate replace to="/" />} />
         <Route path="/new" element={<NewSession />} />
-        <Route path="/try" element={<Try />} />
         <Route path="/admin" element={<AdminDashboard />} />
         <Route path="/:slug" element={<Viewer />} />
         <Route path="/:slug/host" element={<Host />} />

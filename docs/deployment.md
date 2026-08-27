@@ -102,8 +102,30 @@ For production, attach a custom domain to the bucket rather than using an
 
 ```text
 R2_PUBLIC_BASE_URL=https://cdn.example.com
+# Include any previous/secondary domain that exposed this bucket:
+R2_CACHE_PURGE_BASE_URLS=https://old-cdn.example.com
+R2_CACHE_PURGE_ZONE_ID=<custom-domain-zone-id>
+R2_CACHE_PURGE_API_TOKEN=<cache-purge-api-token>
 ASSET_CDN_BASE_URL=https://cdn.example.com
 ```
+
+Create the API token under **Manage Account > API Tokens** with the zone-level
+**Cache Purge** permission, scoped to the custom domain's zone. The server
+uploads PDFs with `Cache-Control: no-store`. When a PDF is deleted it also
+purges that generated filename by URL prefix (including cache-key variants),
+and keeps the durable cleanup record until both R2 deletion and cache purge
+succeed. Leave `R2_PUBLIC_BASE_URL` unset if the public domain cannot be purged
+this way.
+
+`R2_PUBLIC_BASE_URL` is added to the purge list automatically. An
+`ASSET_CDN_BASE_URL` used only for compiled JavaScript and CSS does not require
+slide-purge credentials and is never inferred as a slide origin. If that
+hostname also exposes the shared bucket's `slides/` path, add it explicitly to
+`R2_CACHE_PURGE_BASE_URLS`. Before upgrading, put every previous or secondary
+public slide base in that comma-separated value. All listed hostnames must
+belong to `R2_CACHE_PURGE_ZONE_ID`; manually purge and remove any domain from
+another zone before the upgrade. Direct public PDF delivery will not start
+without purge credentials.
 
 Set only `R2_PUBLIC_BASE_URL` if direct PDF delivery is wanted without moving
 compiled assets to the CDN. Set only `ASSET_CDN_BASE_URL` if only compiled
@@ -134,7 +156,8 @@ replacing the origin if needed:
 
 After changing CORS on an active custom domain, purge cached responses for that
 hostname so stale headers are not served. See Cloudflare's [public bucket](https://developers.cloudflare.com/r2/buckets/public-buckets/)
-and [CORS](https://developers.cloudflare.com/r2/buckets/cors/) documentation.
+and [CORS](https://developers.cloudflare.com/r2/buckets/cors/) documentation,
+plus the [prefix purge API](https://developers.cloudflare.com/cache/how-to/purge-cache/purge_by_prefix/).
 
 `ASSET_CDN_BASE_URL` is a build-time setting. The deployed `index.html` and the
 uploaded hashed assets must come from the same build. Render's blueprint runs
@@ -149,6 +172,10 @@ after rollback if those objects were removed. If an R2 lifecycle rule cleans up
 and remove a hash only after no supported deployment references it.
 
 ## 3. Deploy on Render
+
+The steps below describe a new deployment. For an existing data-bearing
+service, do not start the candidate release before taking rollback backups;
+follow the **Retired-data upgrade sequence** under Operations.
 
 1. Create a [Render Blueprint](https://render.com/docs/infrastructure-as-code)
    from the repository. Render reads `render.yaml`.
@@ -168,12 +195,14 @@ and remove a hash only after no supported deployment references it.
 6. Deploy with viewer audio disabled first.
 7. Attach the production domain, confirm HTTPS, and update `PUBLIC_ORIGIN` if
    the visible origin changed.
-8. Open a Render shell and run:
+8. Open a Render shell and run the read-only inspection:
 
    ```bash
    npm run preflight
    ```
 
+   The command opens the deployed database read-only and validates migrations
+   against a temporary copy. It does not delete objects or compact SQLite.
 9. Check `https://talk.example.com/healthz`, create a test session, and exercise
    the viewer and host pages.
 
@@ -214,12 +243,6 @@ honoring applicable access or deletion requests. The application can persist:
 
 - attendee profiles: a viewer ID, optional name and company, join count, total
   watch time, and first-joined and last-seen timestamps;
-- beta leads: supplied and normalized email, full name, company, budget range,
-  linked session slug, duplicate-attempt counters, expedite requests, feedback,
-  and related timestamps;
-- trial rate-limit and abuse audit data: hashed IP/rate-limit keys, a short
-  Gemini-key hash prefix, supplied and normalized email, session slug, outcome,
-  reason, status, detail, and timestamps;
 - source and translated transcript text with language, timing, slide position,
   finalization state, and session association;
 - session metadata, poll votes tied to viewer IDs, reaction tallies, attendance
@@ -235,7 +258,7 @@ cross-border-transfer, and user-rights duties apply to their use.
 
 ## Operations
 
-Back up SQLite and uploads before deployments or maintenance:
+Back up SQLite and local uploads before deployments or maintenance:
 
 ```bash
 npm run backup -- --out /data/backups/backup-name
@@ -247,15 +270,56 @@ Restore only while the service is stopped:
 npm run restore -- --backup /data/backups/backup-name --force
 ```
 
-Each backup contains a complete SQLite copy and uploaded files, so it can retain
-attendee profiles, beta leads, abuse-audit records, transcripts, and decks after
-the live database is cleaned. Encrypt and access-control off-service copies,
-apply a documented expiry schedule to backups as well as primary data, and
-include backup copies in deletion and incident-response procedures.
+Each backup contains a complete SQLite copy and files in `UPLOADS_DIR`, so it
+can retain attendee profiles, transcripts, and locally stored decks after the
+live database is cleaned. It does **not** export R2. Before an upgrade that may
+retire decks, separately create and verify a versioned copy or export of the
+bucket's `slides/` prefix and inventory every current and historical public
+slide origin needed for rollback.
+
+Backups created by older releases can also retain data from the retired trial
+flows, including lead contact details, abuse-prevention hashes and audit rows,
+trial sessions, transcripts, attendee records, and uploaded decks. The upgrade
+removes those records from the active schema but does not rewrite historical
+backups. Encrypt and access-control off-service copies, apply a documented
+expiry schedule to backups as well as primary data, and include backup copies
+in deletion and incident-response procedures.
 
 The restore command keeps a safety copy of replaced data. Schedule recurring
 backups outside active talks, copy backups off the service disk, and monitor the
 disk's free space.
+
+### Retired-data upgrade sequence
+
+Use a quiet window with one application instance and no active talk:
+
+1. Build the candidate release and run `npm run preflight` against the existing
+   database. This is read-only; it reports legacy schema and queued maintenance
+   without exposing slide references or personal data.
+2. Stop or quiesce application writes. Create and verify off-service SQLite,
+   local-upload, and R2 `slides/` backups. Rehearse the migration on a
+   production-sized copy and record elapsed time and peak disk use.
+3. Deploy client and server together. Startup performs only the transactional
+   logical migration. Failed local, R2, or cache deletion remains queued and is
+   retried every 30 seconds while the service stays healthy.
+4. Inspect maintenance state with `npm run preflight`. When deck cleanup has
+   completed, stop the service and ensure the database filesystem has free
+   space of at least twice the database size plus the current WAL size, then
+   run:
+
+   ```bash
+   npm run maintenance:compact
+   npm run preflight -- --strict-current
+   ```
+
+   A lock, busy checkpoint, or insufficient-space error leaves compaction
+   queued for a later retry and does not affect the next application start.
+5. After health and strict preflight pass, exercise session creation, host,
+   stage, viewer, end, and restart behavior.
+
+Rollback after the logical migration requires stopping the service and
+restoring the matching SQLite, local-upload, and R2 snapshots. Reverting code
+without restoring data is not a complete rollback.
 
 Before each release:
 
@@ -270,7 +334,7 @@ room state and the Gemini session cannot survive a process restart.
 
 | Symptom | Check |
 |---|---|
-| Server exits during startup | Production has `GEMINI_API_KEY`, a non-placeholder `ADMIN_SECRET` of at least 16 characters, and writable `/data` paths. |
+| Server exits during startup | Production has `GEMINI_API_KEY`, a non-placeholder `ADMIN_SECRET` of at least 16 characters, and writable `/data` paths. Pending deck cleanup and compaction do not block startup. |
 | Cloudflare callback check fails | `PUBLIC_ORIGIN` is HTTPS, WebSocket upgrades reach the app, the Realtime app ID and app secret match, and no access challenge covers `/audio/ingest/*`. |
 | PDFs fall back to local disk | All four R2 credential variables are present and scoped to the configured bucket. |
 | CDN module or PDF request fails CORS | The exact app origin is in `AllowedOrigins`; purge the CDN cache after changing the policy. |

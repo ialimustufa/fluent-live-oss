@@ -6,13 +6,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadEnv } from './env.js';
-import { deleteSession, getTrialSessions, initDb } from './db.js';
+import { initDb } from './db.js';
 import { registerRoutes } from './routes.js';
 import { attachWebSocketServer } from './ws.js';
 import { closeAllRooms, configureRooms } from './rooms.js';
 import { isGeneratedPdfUpload } from './uploads.js';
 import { createSlideStorage } from './storage.js';
 import { RealtimeAudioFanout } from './realtime-audio.js';
+import { SlideCleanupWorker } from './slide-cleanup-worker.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -31,18 +32,13 @@ function unique<T>(values: (T | null | undefined)[]): T[] {
 
 async function main(): Promise<void> {
   const env = loadEnv();
-  initDb(env.DATABASE_PATH);
+  const { database } = initDb(env.DATABASE_PATH);
   const slideStorage = createSlideStorage(env);
   const audioFanout = new RealtimeAudioFanout(env);
   configureRooms(env.GEMINI_API_KEY, env.MAX_VIEWERS_PER_SESSION, audioFanout, {
     audioSyncMetadata: env.AUDIO_SYNC_METADATA,
   });
   fs.mkdirSync(env.UPLOADS_DIR, { recursive: true });
-
-  for (const trial of getTrialSessions()) {
-    deleteSession(trial.slug);
-    await slideStorage.remove(trial.slide_ref);
-  }
 
   const app = Fastify({
     logger: {
@@ -54,20 +50,24 @@ async function main(): Promise<void> {
           'headers.authorization',
           'headers.cookie',
           'payload.auth',
-          'payload.geminiApiKey',
-          'geminiApiKey',
-          'geminiKey',
-          'hostToken',
           'ADMIN_SECRET',
           'GEMINI_API_KEY',
           'CF_REALTIME_APP_TOKEN',
           'CF_REALTIME_APP_SECRET',
           'R2_SECRET_ACCESS_KEY',
+          'R2_CACHE_PURGE_API_TOKEN',
         ],
         censor: '[redacted]',
       },
     },
     trustProxy: env.TRUST_PROXY,
+  });
+  const slideCleanupWorker = new SlideCleanupWorker(slideStorage, app.log);
+  app.addHook('onClose', async () => {
+    await slideCleanupWorker.stop();
+    // Close SQLite after all queued worker activity has stopped so WAL data is
+    // checkpointed before an operator takes an off-service database backup.
+    if (database.open) database.close();
   });
 
   const r2Origin = originOf(env.R2_PUBLIC_BASE_URL);
@@ -125,10 +125,17 @@ async function main(): Promise<void> {
       return;
     }
     if (pdf.contentLength !== undefined) reply.header('Content-Length', String(pdf.contentLength));
-    return reply.type('application/pdf').header('Cache-Control', 'public, max-age=3600').send(pdf.body);
+    return reply
+      .type('application/pdf')
+      .header('Cache-Control', 'private, no-store, max-age=0')
+      .send(pdf.body);
   });
 
-  registerRoutes(app, env, { slideStorage, audioFanout });
+  registerRoutes(app, env, {
+    slideStorage,
+    audioFanout,
+    wakeSlideCleanup: () => slideCleanupWorker.wake(),
+  });
 
   // Built client (client/dist) — present in production, absent in dev
   // (the Vite dev server proxies /api, /ws and /uploads to us instead).
@@ -213,6 +220,7 @@ async function main(): Promise<void> {
   }
 
   await app.listen({ port: env.PORT, host: env.HOST });
+  slideCleanupWorker.start();
   app.log.info(`Fluent listening on ${env.HOST}:${env.PORT}`);
 }
 

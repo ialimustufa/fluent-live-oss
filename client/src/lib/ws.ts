@@ -1,3 +1,5 @@
+import type { LivePoll } from './api';
+
 /**
  * Resilient WS client for /ws/{slug}. Auto-reconnects with backoff and
  * re-sends the hello handshake on every (re)connect, so viewers' pages
@@ -11,6 +13,16 @@ export interface WsEnvelope<T = unknown> {
 }
 
 export type WsHandler = (msg: WsEnvelope) => void;
+
+/** Initial state sent after a successful hello handshake. */
+export interface SessionSnapshotPayload {
+  state: string;
+  slideIndex: number;
+  recentTranscripts: { kind: 'input' | 'output'; text: string }[];
+  activePoll: LivePoll | null;
+  /** Connection-scoped authority; clients must not infer this from a local key. */
+  canPresent: boolean;
+}
 
 /**
  * Close codes that will recur the instant we reconnect, so retrying just tight-

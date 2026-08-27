@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3';
 import fs from 'node:fs';
 import path from 'node:path';
+import { isGeneratedPdfUpload } from './uploads.js';
 
 export interface SessionRow {
   id: number;
@@ -16,44 +17,7 @@ export interface SessionRow {
   started_at: string | null;
   ended_at: string | null;
   peak_viewers: number;
-  is_trial: number;
-  trial_type: 'none' | 'try' | 'beta';
   presentation_mode: 'in_person' | 'remote';
-}
-
-export interface BetaLeadRow {
-  id: number;
-  normalized_email: string;
-  email: string;
-  full_name: string;
-  company: string;
-  budget: string;
-  session_slug: string;
-  duplicate_attempts: number;
-  expedite_requested: number;
-  expedite_requested_at: string | null;
-  feedback_rating: number | null;
-  feedback_text: string;
-  feedback_submitted_at: string | null;
-  first_trial_at: string;
-  last_duplicate_at: string | null;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface TrialAbuseEventRow {
-  id: number;
-  flow: 'try' | 'beta';
-  allowed: number;
-  reason: string;
-  ip_hash: string;
-  email: string;
-  normalized_email: string;
-  key_hash_prefix: string;
-  session_slug: string | null;
-  status_code: number | null;
-  detail: string;
-  created_at: string;
 }
 
 export interface AttendeeRow {
@@ -82,7 +46,177 @@ export interface TranscriptRow {
 
 let db: Database.Database;
 
-export function initDb(databasePath: string): Database.Database {
+export interface InitDbResult {
+  database: Database.Database;
+  pendingSlideRefs: string[];
+}
+
+export const RETIRED_DATA_COMPACTION_TASK = 'retired_public_data_compaction';
+
+const RETIRED_DATA_TABLES = [
+  'beta_leads',
+  'trial_rate_limits',
+  'trial_abuse_events',
+] as const;
+
+const RETIRED_SCHEMA_OBJECTS = [
+  ...RETIRED_DATA_TABLES,
+  'idx_trial_rate_limits_updated',
+  'idx_trial_abuse_events_created',
+  'idx_trial_abuse_events_ip',
+  'idx_trial_abuse_events_email',
+] as const;
+
+interface LegacyTrialSchemaDetails {
+  hasIsTrial: boolean;
+  hasTrialType: boolean;
+  objectNames: Set<string>;
+  legacySessionCount: number;
+  legacyTableRowCount: number;
+}
+
+export interface LegacyTrialSchemaInspection {
+  migrationRequired: boolean;
+  legacySessionCount: number;
+  legacyTableRowCount: number;
+}
+
+function legacyTrialSchemaDetails(database: Database.Database): LegacyTrialSchemaDetails {
+  const columns = database.prepare(`PRAGMA table_info(sessions)`).all() as { name: string }[];
+  const hasIsTrial = columns.some((column) => column.name === 'is_trial');
+  const hasTrialType = columns.some((column) => column.name === 'trial_type');
+  const objectNames = new Set(
+    (database
+      .prepare(
+        `SELECT name FROM sqlite_master
+         WHERE name IN (${RETIRED_SCHEMA_OBJECTS.map(() => '?').join(', ')})`
+      )
+      .all(...RETIRED_SCHEMA_OBJECTS) as { name: string }[]).map((row) => row.name)
+  );
+
+  const predicates: string[] = [];
+  if (hasIsTrial) predicates.push('is_trial = 1');
+  if (hasTrialType) predicates.push(`trial_type IN ('try', 'beta')`);
+  const legacySessionCount = predicates.length
+    ? Number(
+        (database
+          .prepare(`SELECT COUNT(*) AS count FROM sessions WHERE ${predicates.join(' OR ')}`)
+          .get() as { count: number }).count
+      )
+    : 0;
+
+  let legacyTableRowCount = 0;
+  for (const table of RETIRED_DATA_TABLES) {
+    if (!objectNames.has(table)) continue;
+    legacyTableRowCount += Number(
+      (database.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }).count
+    );
+  }
+
+  return {
+    hasIsTrial,
+    hasTrialType,
+    objectNames,
+    legacySessionCount,
+    legacyTableRowCount,
+  };
+}
+
+/** Read-only inspection used by preflight and upgrade tooling. */
+export function inspectLegacyTrialSchema(
+  database: Database.Database
+): LegacyTrialSchemaInspection {
+  const details = legacyTrialSchemaDetails(database);
+  return {
+    migrationRequired:
+      details.hasIsTrial || details.hasTrialType || details.objectNames.size > 0,
+    legacySessionCount: details.legacySessionCount,
+    legacyTableRowCount: details.legacyTableRowCount,
+  };
+}
+
+function queueSlideDeletionIfUnreferenced(database: Database.Database, slideRef: string): boolean {
+  // External decks do not have an object managed by this application. Keep
+  // unknown r2: refs visible for operator review, but never infer a key for
+  // them or enqueue ordinary URLs as cleanup work.
+  if (!isGeneratedPdfUpload(slideRef) && !slideRef.startsWith('r2:')) {
+    database.prepare('DELETE FROM pending_slide_deletions WHERE slide_ref = ?').run(slideRef);
+    return false;
+  }
+  const referenced = database
+    .prepare('SELECT 1 FROM sessions WHERE slide_ref = ? LIMIT 1')
+    .get(slideRef);
+  if (referenced) {
+    database.prepare('DELETE FROM pending_slide_deletions WHERE slide_ref = ?').run(slideRef);
+    return false;
+  }
+  database
+    .prepare('INSERT OR IGNORE INTO pending_slide_deletions (slide_ref) VALUES (?)')
+    .run(slideRef);
+  return true;
+}
+
+/**
+ * Remove the retired public-access funnel from databases created by older
+ * releases. DDL is transactional in SQLite, so session/child deletion and
+ * schema removal either commit together or roll back together. Uploaded assets
+ * live outside SQLite, so unreferenced objects are queued durably for cleanup.
+ */
+function scrubLegacyTrialSchema(database: Database.Database): void {
+  const details = legacyTrialSchemaDetails(database);
+  const { hasIsTrial, hasTrialType } = details;
+  if (!hasIsTrial && !hasTrialType && details.objectNames.size === 0) return;
+
+  const predicates: string[] = [];
+  if (hasIsTrial) predicates.push('is_trial = 1');
+  if (hasTrialType) predicates.push(`trial_type IN ('try', 'beta')`);
+
+  const legacySessions = predicates.length
+    ? database
+        .prepare(`SELECT id, slide_ref FROM sessions WHERE ${predicates.join(' OR ')}`)
+        .all() as { id: number; slide_ref: string }[]
+    : [];
+
+  database.transaction(() => {
+    // Scrub deleted cells before they become freelist pages. A durable
+    // compaction task below covers crashes between this commit and VACUUM.
+    database.pragma('secure_delete = ON');
+    const childTables = ['transcripts', 'attendees', 'poll_votes', 'polls', 'reaction_tallies'];
+    for (const table of childTables) {
+      const removeChildren = database.prepare(`DELETE FROM ${table} WHERE session_id = ?`);
+      for (const session of legacySessions) removeChildren.run(session.id);
+    }
+    const removeSession = database.prepare('DELETE FROM sessions WHERE id = ?');
+    for (const session of legacySessions) removeSession.run(session.id);
+
+    // Queue only unreferenced objects. A retained session may legitimately
+    // share a slide_ref, and must keep its deck.
+    for (const slideRef of new Set(legacySessions.map((session) => session.slide_ref))) {
+      queueSlideDeletionIfUnreferenced(database, slideRef);
+    }
+
+    database.exec(`
+      DROP INDEX IF EXISTS idx_trial_rate_limits_updated;
+      DROP INDEX IF EXISTS idx_trial_abuse_events_created;
+      DROP INDEX IF EXISTS idx_trial_abuse_events_ip;
+      DROP INDEX IF EXISTS idx_trial_abuse_events_email;
+      DROP TABLE IF EXISTS beta_leads;
+      DROP TABLE IF EXISTS trial_rate_limits;
+      DROP TABLE IF EXISTS trial_abuse_events;
+    `);
+    if (hasIsTrial) database.exec(`ALTER TABLE sessions DROP COLUMN is_trial`);
+    if (hasTrialType) database.exec(`ALTER TABLE sessions DROP COLUMN trial_type`);
+    // Empty retired columns/tables do not leave sensitive content in free
+    // pages, so they do not warrant a potentially expensive VACUUM.
+    if (details.legacySessionCount > 0 || details.legacyTableRowCount > 0) {
+      database
+        .prepare(`INSERT OR IGNORE INTO database_maintenance_tasks (task) VALUES (?)`)
+        .run(RETIRED_DATA_COMPACTION_TASK);
+    }
+  })();
+}
+
+export function initDb(databasePath: string): InitDbResult {
   fs.mkdirSync(path.dirname(databasePath), { recursive: true });
   db = new Database(databasePath);
   db.pragma('journal_mode = WAL');
@@ -102,6 +236,7 @@ export function initDb(databasePath: string): Database.Database {
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       started_at TEXT,
       ended_at TEXT,
+      peak_viewers INTEGER NOT NULL DEFAULT 0,
       presentation_mode TEXT NOT NULL DEFAULT 'in_person' CHECK (presentation_mode IN ('in_person','remote'))
     );
 
@@ -162,74 +297,22 @@ export function initDb(databasePath: string): Database.Database {
       UNIQUE(session_id, emoji)
     );
 
-    CREATE TABLE IF NOT EXISTS beta_leads (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      normalized_email TEXT NOT NULL UNIQUE,
-      email TEXT NOT NULL,
-      full_name TEXT NOT NULL,
-      company TEXT NOT NULL,
-      budget TEXT NOT NULL,
-      session_slug TEXT NOT NULL UNIQUE,
-      duplicate_attempts INTEGER NOT NULL DEFAULT 0,
-      expedite_requested INTEGER NOT NULL DEFAULT 0,
-      expedite_requested_at TEXT,
-      feedback_rating INTEGER,
-      feedback_text TEXT NOT NULL DEFAULT '',
-      feedback_submitted_at TEXT,
-      first_trial_at TEXT NOT NULL DEFAULT (datetime('now')),
-      last_duplicate_at TEXT,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-
-    CREATE TABLE IF NOT EXISTS trial_rate_limits (
-      scope TEXT NOT NULL,
-      key_hash TEXT NOT NULL,
-      window_start_ms INTEGER NOT NULL,
-      count INTEGER NOT NULL DEFAULT 0,
-      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-      PRIMARY KEY (scope, key_hash, window_start_ms)
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_trial_rate_limits_updated
-      ON trial_rate_limits(updated_at);
-
-    CREATE TABLE IF NOT EXISTS trial_abuse_events (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      flow TEXT NOT NULL CHECK (flow IN ('try','beta')),
-      allowed INTEGER NOT NULL DEFAULT 0,
-      reason TEXT NOT NULL,
-      ip_hash TEXT NOT NULL DEFAULT '',
-      email TEXT NOT NULL DEFAULT '',
-      normalized_email TEXT NOT NULL DEFAULT '',
-      key_hash_prefix TEXT NOT NULL DEFAULT '',
-      session_slug TEXT,
-      status_code INTEGER,
-      detail TEXT NOT NULL DEFAULT '',
+    CREATE TABLE IF NOT EXISTS pending_slide_deletions (
+      slide_ref TEXT PRIMARY KEY,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
-    CREATE INDEX IF NOT EXISTS idx_trial_abuse_events_created
-      ON trial_abuse_events(created_at);
+    CREATE TABLE IF NOT EXISTS database_maintenance_tasks (
+      task TEXT PRIMARY KEY,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
 
-    CREATE INDEX IF NOT EXISTS idx_trial_abuse_events_ip
-      ON trial_abuse_events(ip_hash, created_at);
-
-    CREATE INDEX IF NOT EXISTS idx_trial_abuse_events_email
-      ON trial_abuse_events(normalized_email, created_at);
   `);
 
   // Migrations: add columns to pre-existing sessions tables.
   const cols = db.prepare(`PRAGMA table_info(sessions)`).all() as { name: string }[];
   if (!cols.some((c) => c.name === 'peak_viewers')) {
     db.exec(`ALTER TABLE sessions ADD COLUMN peak_viewers INTEGER NOT NULL DEFAULT 0`);
-  }
-  if (!cols.some((c) => c.name === 'is_trial')) {
-    db.exec(`ALTER TABLE sessions ADD COLUMN is_trial INTEGER NOT NULL DEFAULT 0`);
-  }
-  if (!cols.some((c) => c.name === 'trial_type')) {
-    db.exec(`ALTER TABLE sessions ADD COLUMN trial_type TEXT NOT NULL DEFAULT 'none'`);
-    db.exec(`UPDATE sessions SET trial_type = CASE WHEN is_trial = 1 THEN 'try' ELSE 'none' END`);
   }
   if (!cols.some((c) => c.name === 'presentation_mode')) {
     db.exec(`ALTER TABLE sessions ADD COLUMN presentation_mode TEXT NOT NULL DEFAULT 'in_person'`);
@@ -239,29 +322,78 @@ export function initDb(databasePath: string): Database.Database {
   if (pollCols.length && !pollCols.some((c) => c.name === 'correct')) {
     db.exec(`ALTER TABLE polls ADD COLUMN correct TEXT NOT NULL DEFAULT '[]'`);
   }
-  const betaLeadCols = db.prepare(`PRAGMA table_info(beta_leads)`).all() as { name: string }[];
-  if (betaLeadCols.length && !betaLeadCols.some((c) => c.name === 'expedite_requested')) {
-    db.exec(`ALTER TABLE beta_leads ADD COLUMN expedite_requested INTEGER NOT NULL DEFAULT 0`);
-  }
-  if (betaLeadCols.length && !betaLeadCols.some((c) => c.name === 'expedite_requested_at')) {
-    db.exec(`ALTER TABLE beta_leads ADD COLUMN expedite_requested_at TEXT`);
-  }
-  if (betaLeadCols.length && !betaLeadCols.some((c) => c.name === 'feedback_rating')) {
-    db.exec(`ALTER TABLE beta_leads ADD COLUMN feedback_rating INTEGER`);
-  }
-  if (betaLeadCols.length && !betaLeadCols.some((c) => c.name === 'feedback_text')) {
-    db.exec(`ALTER TABLE beta_leads ADD COLUMN feedback_text TEXT NOT NULL DEFAULT ''`);
-  }
-  if (betaLeadCols.length && !betaLeadCols.some((c) => c.name === 'feedback_submitted_at')) {
-    db.exec(`ALTER TABLE beta_leads ADD COLUMN feedback_submitted_at TEXT`);
-  }
-
-  return db;
+  scrubLegacyTrialSchema(db);
+  const pendingSlideRefs = listPendingSlideDeletions(db);
+  return { database: db, pendingSlideRefs };
 }
 
 export function getDb(): Database.Database {
   if (!db) throw new Error('DB not initialized');
   return db;
+}
+
+export function completePendingSlideDeletion(slideRef: string): void {
+  getDb().prepare('DELETE FROM pending_slide_deletions WHERE slide_ref = ?').run(slideRef);
+}
+
+export function listPendingSlideDeletions(
+  database: Database.Database = getDb()
+): string[] {
+  return database
+    .prepare('SELECT slide_ref FROM pending_slide_deletions ORDER BY created_at, slide_ref')
+    .all()
+    .map((row) => (row as { slide_ref: string }).slide_ref);
+}
+
+/**
+ * Recheck a queued ref immediately before external deletion. If a session has
+ * since attached the ref, the stale queue entry is removed instead.
+ */
+export function preparePendingSlideDeletion(slideRef: string): boolean {
+  const database = getDb();
+  return database.transaction(() => {
+    const pending = database
+      .prepare('SELECT 1 FROM pending_slide_deletions WHERE slide_ref = ?')
+      .get(slideRef);
+    if (!pending) return false;
+    return queueSlideDeletionIfUnreferenced(database, slideRef);
+  })();
+}
+
+/** Durably queue an uploaded object before attempting best-effort deletion. */
+export function queuePendingSlideDeletion(slideRef: string): boolean {
+  return queueSlideDeletionIfUnreferenced(getDb(), slideRef);
+}
+
+export interface DatabaseMaintenanceStatus {
+  pendingSlideDeletionCount: number;
+  compactionPending: boolean;
+}
+
+/** Read-only maintenance status for health/preflight reporting. */
+export function inspectDatabaseMaintenance(
+  database: Database.Database = getDb()
+): DatabaseMaintenanceStatus {
+  const pendingSlideDeletionCount = Number(
+    (database.prepare('SELECT COUNT(*) AS count FROM pending_slide_deletions').get() as {
+      count: number;
+    }).count
+  );
+  const compactionPending = Boolean(
+    database
+      .prepare('SELECT 1 FROM database_maintenance_tasks WHERE task = ?')
+      .get(RETIRED_DATA_COMPACTION_TASK)
+  );
+  return { pendingSlideDeletionCount, compactionPending };
+}
+
+/** Clear the durable marker only after offline compaction succeeds. */
+export function completeRetiredDataCompaction(
+  database: Database.Database = getDb()
+): void {
+  database
+    .prepare('DELETE FROM database_maintenance_tasks WHERE task = ?')
+    .run(RETIRED_DATA_COMPACTION_TASK);
 }
 
 // --- Session queries ---
@@ -274,63 +406,25 @@ export function createSession(row: {
   slide_ref: string;
   slide_count: number | null;
   echo_target_language: boolean;
-  is_trial?: boolean;
-  trial_type?: 'none' | 'try' | 'beta';
   presentation_mode?: 'in_person' | 'remote';
 }): SessionRow {
-  getDb()
-    .prepare(
-      `INSERT INTO sessions (slug, title, target_lang, slide_type, slide_ref, slide_count, echo_target_language, is_trial, trial_type, presentation_mode)
-       VALUES (@slug, @title, @target_lang, @slide_type, @slide_ref, @slide_count, @echo, @is_trial, @trial_type, @presentation_mode)`
-    )
-    .run({
-      ...row,
-      echo: row.echo_target_language ? 1 : 0,
-      is_trial: row.is_trial ? 1 : 0,
-      trial_type: row.trial_type ?? (row.is_trial ? 'try' : 'none'),
-      presentation_mode: row.presentation_mode ?? 'in_person',
-    });
-  return getSessionBySlug(row.slug)!;
-}
-
-export function createBetaTrialSession(row: {
-  session: {
-    slug: string;
-    title: string;
-    target_lang: string;
-    slide_type: string;
-    slide_ref: string;
-    slide_count: number | null;
-    echo_target_language: boolean;
-    presentation_mode?: 'in_person' | 'remote';
-  };
-  lead: {
-    normalized_email: string;
-    email: string;
-    full_name: string;
-    company: string;
-    budget: string;
-  };
-}): SessionRow {
-  const db = getDb();
-  db.transaction(() => {
-    db.prepare(
-      `INSERT INTO sessions (slug, title, target_lang, slide_type, slide_ref, slide_count, echo_target_language, is_trial, trial_type, presentation_mode)
-       VALUES (@slug, @title, @target_lang, @slide_type, @slide_ref, @slide_count, @echo, 1, 'beta', @presentation_mode)`
-    ).run({
-      ...row.session,
-      echo: row.session.echo_target_language ? 1 : 0,
-      presentation_mode: row.session.presentation_mode ?? 'in_person',
-    });
-    db.prepare(
-      `INSERT INTO beta_leads (normalized_email, email, full_name, company, budget, session_slug)
-       VALUES (@normalized_email, @email, @full_name, @company, @budget, @session_slug)`
-    ).run({
-      ...row.lead,
-      session_slug: row.session.slug,
-    });
+  const database = getDb();
+  database.transaction(() => {
+    database
+      .prepare(
+        `INSERT INTO sessions (slug, title, target_lang, slide_type, slide_ref, slide_count, echo_target_language, presentation_mode)
+         VALUES (@slug, @title, @target_lang, @slide_type, @slide_ref, @slide_count, @echo, @presentation_mode)`
+      )
+      .run({
+        ...row,
+        echo: row.echo_target_language ? 1 : 0,
+        presentation_mode: row.presentation_mode ?? 'in_person',
+      });
+    // A successful attachment supersedes any stale failed-cleanup entry for
+    // the same ref, and both changes commit atomically.
+    database.prepare('DELETE FROM pending_slide_deletions WHERE slide_ref = ?').run(row.slide_ref);
   })();
-  return getSessionBySlug(row.session.slug)!;
+  return getSessionBySlug(row.slug)!;
 }
 
 export function getSessionBySlug(slug: string): SessionRow | undefined {
@@ -432,186 +526,9 @@ export function getAllSessions(): (SessionRow & { attendee_count: number })[] {
   return getDb()
     .prepare(
       `SELECT s.*, (SELECT COUNT(*) FROM attendees a WHERE a.session_id = s.id) AS attendee_count
-       FROM sessions s WHERE s.is_trial = 0 ORDER BY datetime(s.created_at) DESC, s.id DESC`
+       FROM sessions s ORDER BY datetime(s.created_at) DESC, s.id DESC`
     )
     .all() as (SessionRow & { attendee_count: number })[];
-}
-
-export function getTrialSessions(): SessionRow[] {
-  return getDb()
-    .prepare('SELECT * FROM sessions WHERE is_trial = 1 ORDER BY datetime(created_at) ASC, id ASC')
-    .all() as SessionRow[];
-}
-
-export function getBetaLeadByNormalizedEmail(normalizedEmail: string): BetaLeadRow | undefined {
-  return getDb()
-    .prepare('SELECT * FROM beta_leads WHERE normalized_email = ?')
-    .get(normalizedEmail) as BetaLeadRow | undefined;
-}
-
-export function getBetaLeadBySessionSlug(slug: string): BetaLeadRow | undefined {
-  return getDb()
-    .prepare('SELECT * FROM beta_leads WHERE session_slug = ?')
-    .get(slug) as BetaLeadRow | undefined;
-}
-
-export function recordBetaLeadDuplicate(normalizedEmail: string): void {
-  getDb()
-    .prepare(
-      `UPDATE beta_leads
-       SET duplicate_attempts = duplicate_attempts + 1,
-           last_duplicate_at = datetime('now'),
-           updated_at = datetime('now')
-       WHERE normalized_email = ?`
-    )
-    .run(normalizedEmail);
-}
-
-export function getBetaLeads(): BetaLeadRow[] {
-  return getDb()
-    .prepare(
-      `SELECT * FROM beta_leads
-       ORDER BY datetime(first_trial_at) DESC, id DESC`
-    )
-    .all() as BetaLeadRow[];
-}
-
-export function consumeTrialRateLimit(row: {
-  scope: string;
-  key_hash: string;
-  window_ms: number;
-  max: number;
-}): { allowed: boolean; count: number; resetAtMs: number } {
-  const now = Date.now();
-  const windowStartMs = Math.floor(now / row.window_ms) * row.window_ms;
-  const resetAtMs = windowStartMs + row.window_ms;
-  const db = getDb();
-
-  const result = db.transaction(() => {
-    db.prepare(
-      `DELETE FROM trial_rate_limits
-       WHERE updated_at < datetime('now', '-2 days')`
-    ).run();
-    const existing = db
-      .prepare(
-        `SELECT count FROM trial_rate_limits
-         WHERE scope = @scope AND key_hash = @key_hash AND window_start_ms = @window_start_ms`
-      )
-      .get({
-        scope: row.scope,
-        key_hash: row.key_hash,
-        window_start_ms: windowStartMs,
-      }) as { count: number } | undefined;
-
-    if (!existing) {
-      db.prepare(
-        `INSERT INTO trial_rate_limits (scope, key_hash, window_start_ms, count)
-         VALUES (@scope, @key_hash, @window_start_ms, 1)`
-      ).run({
-        scope: row.scope,
-        key_hash: row.key_hash,
-        window_start_ms: windowStartMs,
-      });
-      return { allowed: true, count: 1, resetAtMs };
-    }
-
-    if (existing.count >= row.max) {
-      return { allowed: false, count: existing.count, resetAtMs };
-    }
-
-    const nextCount = existing.count + 1;
-    db.prepare(
-      `UPDATE trial_rate_limits
-       SET count = @count, updated_at = datetime('now')
-       WHERE scope = @scope AND key_hash = @key_hash AND window_start_ms = @window_start_ms`
-    ).run({
-      scope: row.scope,
-      key_hash: row.key_hash,
-      window_start_ms: windowStartMs,
-      count: nextCount,
-    });
-    return { allowed: true, count: nextCount, resetAtMs };
-  })();
-
-  return result;
-}
-
-export function recordTrialAbuseEvent(row: {
-  flow: 'try' | 'beta';
-  allowed: boolean;
-  reason: string;
-  ip_hash: string;
-  email?: string;
-  normalized_email?: string;
-  key_hash_prefix?: string;
-  session_slug?: string | null;
-  status_code?: number | null;
-  detail?: string;
-}): void {
-  getDb()
-    .prepare(
-      `INSERT INTO trial_abuse_events (
-         flow, allowed, reason, ip_hash, email, normalized_email,
-         key_hash_prefix, session_slug, status_code, detail
-       )
-       VALUES (
-         @flow, @allowed, @reason, @ip_hash, @email, @normalized_email,
-         @key_hash_prefix, @session_slug, @status_code, @detail
-       )`
-    )
-    .run({
-      flow: row.flow,
-      allowed: row.allowed ? 1 : 0,
-      reason: row.reason.slice(0, 80),
-      ip_hash: row.ip_hash,
-      email: (row.email ?? '').slice(0, 254),
-      normalized_email: (row.normalized_email ?? '').slice(0, 254),
-      key_hash_prefix: (row.key_hash_prefix ?? '').slice(0, 24),
-      session_slug: row.session_slug ?? null,
-      status_code: row.status_code ?? null,
-      detail: (row.detail ?? '').slice(0, 500),
-    });
-}
-
-export function getTrialAbuseEvents(limit = 100): TrialAbuseEventRow[] {
-  return getDb()
-    .prepare(
-      `SELECT * FROM trial_abuse_events
-       ORDER BY datetime(created_at) DESC, id DESC
-       LIMIT ?`
-    )
-    .all(Math.max(1, Math.min(500, Math.floor(limit)))) as TrialAbuseEventRow[];
-}
-
-export function recordBetaLeadExpedite(sessionSlug: string): BetaLeadRow | undefined {
-  getDb()
-    .prepare(
-      `UPDATE beta_leads
-       SET expedite_requested = 1,
-           expedite_requested_at = COALESCE(expedite_requested_at, datetime('now')),
-           updated_at = datetime('now')
-       WHERE session_slug = ?`
-    )
-    .run(sessionSlug);
-  return getBetaLeadBySessionSlug(sessionSlug);
-}
-
-export function recordBetaLeadFeedback(row: {
-  session_slug: string;
-  rating: number;
-  feedback_text: string;
-}): BetaLeadRow | undefined {
-  getDb()
-    .prepare(
-      `UPDATE beta_leads
-       SET feedback_rating = @rating,
-           feedback_text = @feedback_text,
-           feedback_submitted_at = datetime('now'),
-           updated_at = datetime('now')
-       WHERE session_slug = @session_slug`
-    )
-    .run(row);
-  return getBetaLeadBySessionSlug(row.session_slug);
 }
 
 export function updateSessionMeta(
@@ -640,10 +557,15 @@ export function updateSessionMeta(
 
 /** Delete a session and all its child rows. Returns the slide ref so the
  *  caller can clean up any uploaded file. */
-export function deleteSession(slug: string): { slide_ref: string; slide_type: string } | null {
+export function deleteSession(slug: string): {
+  slide_ref: string;
+  slide_type: string;
+  cleanup_pending: boolean;
+} | null {
   const s = getSessionBySlug(slug);
   if (!s) return null;
   const db = getDb();
+  let cleanupPending = false;
   db.transaction(() => {
     db.prepare('DELETE FROM transcripts WHERE session_id = ?').run(s.id);
     db.prepare('DELETE FROM attendees WHERE session_id = ?').run(s.id);
@@ -651,8 +573,12 @@ export function deleteSession(slug: string): { slide_ref: string; slide_type: st
     db.prepare('DELETE FROM polls WHERE session_id = ?').run(s.id);
     db.prepare('DELETE FROM reaction_tallies WHERE session_id = ?').run(s.id);
     db.prepare('DELETE FROM sessions WHERE id = ?').run(s.id);
+    // Only PDF sessions own a managed local/R2 object. Google Slides and HTML
+    // sessions reference external URLs and need no storage maintenance.
+    cleanupPending =
+      s.slide_type === 'pdf' && queueSlideDeletionIfUnreferenced(db, s.slide_ref);
   })();
-  return { slide_ref: s.slide_ref, slide_type: s.slide_type };
+  return { slide_ref: s.slide_ref, slide_type: s.slide_type, cleanup_pending: cleanupPending };
 }
 
 // --- Interactive layer: polls + reactions ---

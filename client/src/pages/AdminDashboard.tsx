@@ -3,12 +3,10 @@ import { Link } from 'react-router-dom';
 import { Plus, Users } from 'lucide-react';
 import {
   listSessions,
-  listBetaLeads,
   updateSession,
   deleteSession,
   fetchLanguages,
   type SessionListItem,
-  type BetaLead,
   type Language,
 } from '../lib/api';
 import { getAdminKey } from '../lib/adminKey';
@@ -39,11 +37,9 @@ const STATE_STYLE: Record<string, string> = {
 
 function Dashboard() {
   const [sessions, setSessions] = useState<SessionListItem[] | null>(null);
-  const [betaLeads, setBetaLeads] = useState<BetaLead[] | null>(null);
   const [languages, setLanguages] = useState<Language[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [editing, setEditing] = useState<string | null>(null);
-  const [view, setView] = useState<'talks' | 'beta'>('talks');
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [draft, setDraft] = useState<{ title: string; targetLang: string; echo: boolean }>({
     title: '',
@@ -55,11 +51,8 @@ function Dashboard() {
   const key = getAdminKey() ?? '';
 
   const refresh = () =>
-    Promise.all([listSessions(key), listBetaLeads(key)])
-      .then(([nextSessions, nextLeads]) => {
-        setSessions(nextSessions);
-        setBetaLeads(nextLeads);
-      })
+    listSessions(key)
+      .then(setSessions)
       .catch((e) => setError(String(e.message ?? e)));
 
   useEffect(() => {
@@ -109,17 +102,9 @@ function Dashboard() {
       <div className="animate-fade-up mx-auto max-w-3xl">
         <div className="mb-8 flex items-center justify-between">
           <div>
-            <h1 className="text-2xl font-bold text-[var(--fg)]">
-              {view === 'talks' ? 'Your talks' : 'Beta leads'}
-            </h1>
+            <h1 className="text-2xl font-bold text-[var(--fg)]">Your talks</h1>
             <p className="mt-1 text-sm text-[var(--faint)]">
-              {view === 'talks'
-                ? sessions
-                  ? `${sessions.length} session${sessions.length === 1 ? '' : 's'}`
-                  : 'Loading...'
-                : betaLeads
-                  ? `${betaLeads.length} lead${betaLeads.length === 1 ? '' : 's'}`
-                  : 'Loading...'}
+              {sessions ? `${sessions.length} session${sessions.length === 1 ? '' : 's'}` : 'Loading...'}
             </p>
           </div>
           <div className="flex items-center gap-2">
@@ -130,43 +115,19 @@ function Dashboard() {
           </div>
         </div>
 
-        <div className="mb-4 grid grid-cols-2 gap-1 rounded-xl bg-[var(--surface-2)] p-1 text-sm ring-1 ring-inset ring-[var(--border)]">
-          {([
-            ['talks', 'Talks', sessions?.length ?? 0],
-            ['beta', 'Beta leads', betaLeads?.length ?? 0],
-          ] as const).map(([value, label, count]) => (
-            <button
-              key={value}
-              type="button"
-              onClick={() => setView(value)}
-              className={`rounded-lg px-3 py-2 font-semibold transition ${
-                view === value ? 'grad-fill shadow-sm' : 'text-[var(--muted)] hover:text-[var(--fg)]'
-              }`}
-            >
-              {label} <span className="opacity-70">({count})</span>
-            </button>
-          ))}
-        </div>
-
         {error && (
           <p className="mb-4 rounded-[var(--r-md)] bg-error-soft px-3 py-2 text-sm text-error ring-1 ring-inset ring-error">
             {error}
           </p>
         )}
 
-        {view === 'talks' && sessions && sessions.length === 0 && (
+        {sessions && sessions.length === 0 && (
           <div className="glass-panel rounded-2xl px-6 py-12 text-center text-[var(--faint)]">
             No talks yet. Create your first presentation.
           </div>
         )}
 
-        {view === 'beta' && betaLeads && betaLeads.length === 0 && (
-          <div className="glass-panel rounded-2xl px-6 py-12 text-center text-[var(--faint)]">
-            No beta leads yet.
-          </div>
-        )}
-
-        {view === 'talks' && (
+        {sessions && (
           <div className="space-y-3">
             {sessions?.map((s) => (
               <div key={s.slug} className={`glass-panel rounded-2xl p-4 ${s.state === 'live' ? 'grad-border' : ''}`}>
@@ -286,76 +247,6 @@ function Dashboard() {
                       )}
                     </div>
                   </>
-                )}
-              </div>
-            ))}
-          </div>
-        )}
-
-        {view === 'beta' && (
-          <div className="space-y-3">
-            {betaLeads?.map((lead) => (
-              <div key={lead.id} className="glass-panel rounded-2xl p-4">
-                <div className="flex items-start justify-between gap-3">
-                  <div className="min-w-0">
-                    <h2 className="truncate font-semibold text-[var(--fg)]">{lead.fullName}</h2>
-                    <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[11px]">
-                      <a
-                        href={`mailto:${lead.email}`}
-                        className="rounded-full bg-[var(--surface-2)] px-2 py-0.5 text-[var(--muted)] ring-1 ring-inset ring-[var(--border)] transition hover:text-[var(--fg)]"
-                      >
-                        {lead.email}
-                      </a>
-                      <span className="rounded-full bg-[var(--surface-2)] px-2 py-0.5 text-[var(--muted)] ring-1 ring-inset ring-[var(--border)]">
-                        {lead.company}
-                      </span>
-                      <span className="rounded-full bg-[var(--surface-2)] px-2 py-0.5 text-[var(--muted)] ring-1 ring-inset ring-[var(--border)]">
-                        {lead.budget}
-                      </span>
-                      {lead.expediteRequested && (
-                        <span className="rounded-full bg-warning-soft px-2 py-0.5 font-semibold text-warning ring-1 ring-inset ring-warning">
-                          expedited
-                        </span>
-                      )}
-                      {lead.feedbackRating && (
-                        <span className="rounded-full bg-info-soft px-2 py-0.5 font-semibold text-info ring-1 ring-inset ring-info">
-                          rating {lead.feedbackRating}/5
-                        </span>
-                      )}
-                      <span className="text-[var(--faint)]">{fmtDate(lead.firstTrialAt)}</span>
-                    </div>
-                  </div>
-                  <div className="shrink-0 rounded-[var(--r-md)] bg-[var(--surface-2)] px-3 py-2 text-right ring-1 ring-inset ring-[var(--border)]">
-                    <div className="text-sm font-semibold text-[var(--fg)]">{lead.duplicateAttempts}</div>
-                    <div className="text-[10px] uppercase tracking-wide text-[var(--faint)]">duplicates</div>
-                  </div>
-                </div>
-
-                <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
-                  <span className="rounded-[var(--r-md)] bg-[var(--surface-2)] px-2.5 py-1.5 text-[var(--faint)] ring-1 ring-inset ring-[var(--border)]">
-                    Session {lead.sessionSlug}
-                  </span>
-                  <Link to={`/${lead.sessionSlug}`} className="btn-ghost rounded-lg px-3 py-1.5">
-                    Viewer
-                  </Link>
-                  <Link to={`/${lead.sessionSlug}/transcript`} className="btn-ghost rounded-lg px-3 py-1.5">
-                    Transcript
-                  </Link>
-                  {lead.lastDuplicateAt && (
-                    <span className="text-[var(--faint)]">
-                      Last duplicate {fmtDate(lead.lastDuplicateAt)}
-                    </span>
-                  )}
-                  {lead.expediteRequestedAt && (
-                    <span className="text-warning">
-                      Expedite requested {fmtDate(lead.expediteRequestedAt)}
-                    </span>
-                  )}
-                </div>
-                {lead.feedback && (
-                  <p className="mt-3 rounded-[var(--r-md)] bg-[var(--surface-2)] px-3 py-2 text-xs leading-relaxed text-[var(--muted)] ring-1 ring-inset ring-[var(--border)]">
-                    {lead.feedback}
-                  </p>
                 )}
               </div>
             ))}

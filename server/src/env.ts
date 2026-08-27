@@ -2,7 +2,6 @@ import path from 'node:path';
 
 const MIN_PRODUCTION_ADMIN_SECRET_LENGTH = 16;
 const DEFAULT_PORT = 3000;
-const DEFAULT_TRIAL_TTL_MS = 2 * 60 * 60 * 1000;
 const DEFAULT_MAX_VIEWERS_PER_SESSION = 500;
 
 export interface Env {
@@ -12,10 +11,9 @@ export interface Env {
   UPLOADS_DIR: string;
   PORT: number;
   HOST: string;
-  TRIAL_TTL_MS: number;
   PUBLIC_ORIGIN: string | null;
   TRUST_PROXY: boolean;
-  /** Concurrent-viewer cap for normal (non-trial) sessions; Infinity = unlimited. */
+  /** Concurrent-viewer cap per session; Infinity = unlimited. */
   MAX_VIEWERS_PER_SESSION: number;
   /** Per-IP ceiling for public session/language/poll reads. */
   PUBLIC_GET_MAX: number;
@@ -23,8 +21,6 @@ export interface Env {
   SENTRY_DSN: string | null;
   /** Enables test-only control hooks (e.g. kill_gemini_test). Off in production. */
   ENABLE_TEST_HOOKS: boolean;
-  /** Validate user-supplied trial Gemini keys against Gemini before creating the trial. */
-  VALIDATE_TRIAL_GEMINI_KEYS: boolean;
   /** Emits optional audio/caption timing metadata and audio.marker messages. */
   AUDIO_SYNC_METADATA: boolean;
   /** Operator switch for translated viewer audio. Captions/slides still work when false. */
@@ -40,6 +36,11 @@ export interface Env {
   R2_SECRET_ACCESS_KEY: string | null;
   R2_BUCKET: string | null;
   R2_PUBLIC_BASE_URL: string | null;
+  /** Every current/historical public bucket base that must be purged after deletion. */
+  R2_CACHE_PURGE_BASE_URLS: string[];
+  /** Cloudflare zone/token used to purge directly served PDFs after deletion. */
+  R2_CACHE_PURGE_ZONE_ID: string | null;
+  R2_CACHE_PURGE_API_TOKEN: string | null;
   ASSET_CDN_BASE_URL: string | null;
 }
 
@@ -50,15 +51,6 @@ function parsePort(raw: string | undefined): number {
     throw new Error('PORT must be an integer between 1 and 65535.');
   }
   return port;
-}
-
-function parsePositiveMs(raw: string | undefined, fallback: number, name: string): number {
-  if (raw === undefined || raw.trim() === '') return fallback;
-  const value = Number(raw);
-  if (!Number.isFinite(value) || value <= 0) {
-    throw new Error(`${name} must be a positive number of milliseconds.`);
-  }
-  return value;
 }
 
 /** Positive integer, or `0`/empty → Infinity (explicit "no cap" opt-out). */
@@ -132,6 +124,15 @@ function cleanOptionalUrl(raw: string | undefined, name: string): string | null 
   }
 }
 
+function cleanOptionalUrlList(raw: string | undefined, name: string): string[] {
+  const values = (raw ?? '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .map((value, index) => cleanOptionalUrl(value, `${name}[${index}]`)!);
+  return [...new Set(values)];
+}
+
 export function loadEnv(): Env {
   // Auto-load .env if present (native Node, no dotenv dependency). Checks the
   // cwd first, then the parent — workspace scripts run with cwd=server/ while
@@ -182,7 +183,6 @@ export function loadEnv(): Env {
     );
   }
 
-  const trialTtlMs = parsePositiveMs(process.env.TRIAL_TTL_MS, DEFAULT_TRIAL_TTL_MS, 'TRIAL_TTL_MS');
   const publicOrigin = cleanOptionalOrigin(process.env.PUBLIC_ORIGIN, 'PUBLIC_ORIGIN');
 
   const defaultDatabasePath = isProduction ? '/data/app.db' : './data/app.db';
@@ -209,6 +209,28 @@ export function loadEnv(): Env {
   }
 
   const r2PublicBaseUrl = cleanOptionalUrl(process.env.R2_PUBLIC_BASE_URL, 'R2_PUBLIC_BASE_URL');
+  const assetCdnBaseUrl = cleanOptionalUrl(process.env.ASSET_CDN_BASE_URL, 'ASSET_CDN_BASE_URL');
+  const r2CachePurgeBaseUrls = [
+    ...new Set(
+      [
+        r2PublicBaseUrl,
+        ...cleanOptionalUrlList(process.env.R2_CACHE_PURGE_BASE_URLS, 'R2_CACHE_PURGE_BASE_URLS'),
+      ].filter((value): value is string => Boolean(value))
+    ),
+  ];
+  if (r2CachePurgeBaseUrls.length > 100) {
+    throw new Error('R2_CACHE_PURGE_BASE_URLS supports at most 100 unique public bases.');
+  }
+  const r2CachePurgeZoneId = cleanOptional(process.env.R2_CACHE_PURGE_ZONE_ID);
+  const r2CachePurgeApiToken = cleanOptional(process.env.R2_CACHE_PURGE_API_TOKEN);
+  if (Boolean(r2CachePurgeZoneId) !== Boolean(r2CachePurgeApiToken)) {
+    throw new Error('R2_CACHE_PURGE_ZONE_ID and R2_CACHE_PURGE_API_TOKEN must be set together.');
+  }
+  if (r2CachePurgeBaseUrls.length > 0 && (!r2CachePurgeZoneId || !r2CachePurgeApiToken)) {
+    throw new Error(
+      'R2_CACHE_PURGE_ZONE_ID and R2_CACHE_PURGE_API_TOKEN are required when an R2 slide purge base URL is set.'
+    );
+  }
 
   return {
     GEMINI_API_KEY: geminiKey,
@@ -219,7 +241,6 @@ export function loadEnv(): Env {
     UPLOADS_DIR: path.resolve(process.env.UPLOADS_DIR ?? defaultUploadsDir),
     PORT: parsePort(process.env.PORT),
     HOST: process.env.HOST?.trim() || '0.0.0.0',
-    TRIAL_TTL_MS: trialTtlMs,
     PUBLIC_ORIGIN: publicOrigin,
     TRUST_PROXY: parseBool(process.env.TRUST_PROXY),
     MAX_VIEWERS_PER_SESSION: parseViewerCap(process.env.MAX_VIEWERS_PER_SESSION),
@@ -227,9 +248,6 @@ export function loadEnv(): Env {
     SENTRY_DSN: process.env.SENTRY_DSN?.trim() || null,
     // Test hooks must never be live in production, regardless of the flag.
     ENABLE_TEST_HOOKS: !isProduction && parseBool(process.env.ENABLE_TEST_HOOKS),
-    VALIDATE_TRIAL_GEMINI_KEYS: process.env.VALIDATE_TRIAL_GEMINI_KEYS === undefined
-      ? true
-      : parseBool(process.env.VALIDATE_TRIAL_GEMINI_KEYS),
     AUDIO_SYNC_METADATA: audioSyncMetadata,
     AUDIO_SUBSCRIPTION_ACTIVE: audioSubscriptionActive,
     CF_REALTIME_APP_ID: cfRealtimeAppId,
@@ -240,6 +258,9 @@ export function loadEnv(): Env {
     R2_SECRET_ACCESS_KEY: cleanOptional(process.env.R2_SECRET_ACCESS_KEY),
     R2_BUCKET: cleanOptional(process.env.R2_BUCKET),
     R2_PUBLIC_BASE_URL: r2PublicBaseUrl,
-    ASSET_CDN_BASE_URL: cleanOptionalUrl(process.env.ASSET_CDN_BASE_URL, 'ASSET_CDN_BASE_URL'),
+    R2_CACHE_PURGE_BASE_URLS: r2CachePurgeBaseUrls,
+    R2_CACHE_PURGE_ZONE_ID: r2CachePurgeZoneId,
+    R2_CACHE_PURGE_API_TOKEN: r2CachePurgeApiToken,
+    ASSET_CDN_BASE_URL: assetCdnBaseUrl,
   };
 }

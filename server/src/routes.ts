@@ -1,15 +1,14 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { nanoid } from 'nanoid';
-import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { checkAdminSecret, isRateLimited, recordAuthFailure } from './auth.js';
 import { createFixedWindow } from './rateLimit.js';
 import {
-  createBetaTrialSession,
   createSession,
-  getBetaLeadByNormalizedEmail,
-  getBetaLeads,
+  completePendingSlideDeletion,
+  inspectDatabaseMaintenance,
+  queuePendingSlideDeletion,
   getSessionBySlug,
   getTranscripts,
   getAttendees,
@@ -19,15 +18,9 @@ import {
   deleteSession,
   getPollResults,
   getReactionTallies,
-  recordBetaLeadDuplicate,
-  recordBetaLeadExpedite,
-  recordBetaLeadFeedback,
-  consumeTrialRateLimit,
-  recordTrialAbuseEvent,
 } from './db.js';
 import { isSupportedLanguage, SUPPORTED_LANGUAGES } from './languages.js';
-import { getRoom, deleteRoom, registerTrial, unregisterTrial, getTrial } from './rooms.js';
-import { validateGeminiLiveKey } from './gemini-key.js';
+import { getRoom, deleteRoom } from './rooms.js';
 import fsp from 'node:fs/promises';
 import { pipeline } from 'node:stream/promises';
 import type { Env } from './env.js';
@@ -35,44 +28,6 @@ import type { SlideStorage } from './storage.js';
 import type { RealtimeAudioFanout, RealtimeSubscribeOptions, SessionDescription } from './realtime-audio.js';
 
 const SLUG_ALPHABET_RE = /^[A-Za-z0-9_-]+$/;
-const TRIAL_CREATE_WINDOW_MS = 60_000;
-const TRIAL_CREATE_MAX_PER_WINDOW = 5;
-const BETA_PDF_MAX_BYTES = 5 * 1024 * 1024;
-const BETA_RUNTIME_MS = 2 * 60_000;
-const BETA_MAX_VIEWERS = 10;
-const TRY_RUNTIME_MS = 15 * 60_000;
-const TRY_MAX_VIEWERS = 10;
-const BETA_BUDGETS = new Set([
-  'Not sure yet',
-  'Under $25/hour',
-  '$25-$50/hour',
-  '$50-$100/hour',
-  '$100-$150/hour',
-  '$150+/hour',
-]);
-const DISPOSABLE_EMAIL_DOMAINS = new Set([
-  '10minutemail.com',
-  'anonaddy.com',
-  'burnermail.io',
-  'dispostable.com',
-  'emailondeck.com',
-  'fakeinbox.com',
-  'getairmail.com',
-  'guerrillamail.com',
-  'maildrop.cc',
-  'mailinator.com',
-  'mailnesia.com',
-  'moakt.com',
-  'sharklasers.com',
-  'temp-mail.org',
-  'tempmail.com',
-  'tempmailo.com',
-  'throwawaymail.com',
-  'trashmail.com',
-  'yopmail.com',
-]);
-const PLACEHOLDER_EMAIL_LOCAL_RE =
-  /^(test|testing|fake|demo|example|sample|asdf|qwerty|foo|bar|none|unknown|no-reply|noreply)([._-]?\d*)?$/;
 // Generous per-IP ceiling for the unauthenticated public reads (session info,
 // transcript, polls, languages): high enough not to affect a real viewer
 // polling, low enough to stop a scraping/DoS loop.
@@ -91,29 +46,14 @@ interface ParsedSessionForm {
   upload: TempUpload | null;
 }
 
-interface ParseSessionFormOptions {
-  maxPdfBytes?: number;
-}
-
 interface RouteDeps {
   slideStorage: SlideStorage;
   audioFanout: RealtimeAudioFanout;
+  wakeSlideCleanup: () => void;
 }
 
 function clientIp(req: FastifyRequest): string {
   return req.ip;
-}
-
-function sha256Hex(value: string): string {
-  return crypto.createHash('sha256').update(value).digest('hex');
-}
-
-function keyHashPrefix(value: string): string {
-  return sha256Hex(value).slice(0, 16);
-}
-
-function auditEmail(value: string | undefined): string {
-  return normalizeTextField(value, 254).toLowerCase();
 }
 
 function httpUrlOrigin(value: string): string | null {
@@ -155,175 +95,27 @@ function parseSlideCount(value: string | undefined): number | null | 'invalid' {
   return n;
 }
 
-function normalizeTextField(value: string | undefined, max: number): string {
-  return (value ?? '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, max);
-}
-
-function hasFakeOrDisposableDomain(domain: string): boolean {
-  if (DISPOSABLE_EMAIL_DOMAINS.has(domain)) return true;
-  if (domain.endsWith('.test') || domain.endsWith('.invalid') || domain.endsWith('.localhost')) return true;
-  if (domain === 'localhost' || domain === 'local') return true;
-  if (['example.com', 'example.org', 'example.net', 'test.com', 'demo.com', 'fake.com'].includes(domain)) return true;
-  return false;
-}
-
-function normalizeBetaEmail(rawValue: string | undefined):
-  | { ok: true; email: string; normalizedEmail: string }
-  | { ok: false; error: string } {
-  const raw = (rawValue ?? '').trim().toLowerCase();
-  if (!raw || raw.length > 254 || /\s/.test(raw)) {
-    return { ok: false, error: 'enter a valid work email address' };
-  }
-  const at = raw.lastIndexOf('@');
-  if (at <= 0 || at !== raw.indexOf('@') || at === raw.length - 1) {
-    return { ok: false, error: 'enter a valid work email address' };
-  }
-  const local = raw.slice(0, at);
-  let domain = raw.slice(at + 1);
-  if (
-    local.length > 64 ||
-    !domain.includes('.') ||
-    local.startsWith('.') ||
-    local.endsWith('.') ||
-    local.includes('..') ||
-    domain.includes('..')
-  ) {
-    return { ok: false, error: 'enter a valid work email address' };
-  }
-  if (!/^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+$/.test(local) || !/^[a-z0-9.-]+$/.test(domain)) {
-    return { ok: false, error: 'enter a valid work email address' };
-  }
-  if (hasFakeOrDisposableDomain(domain)) {
-    return { ok: false, error: 'use a real, non-disposable work email address' };
-  }
-
-  let normalizedLocal = local.split('+')[0] ?? '';
-  if (domain === 'googlemail.com') domain = 'gmail.com';
-  if (domain === 'gmail.com') normalizedLocal = normalizedLocal.replace(/\./g, '');
-  if (!normalizedLocal || PLACEHOLDER_EMAIL_LOCAL_RE.test(normalizedLocal)) {
-    return { ok: false, error: 'use a real, non-demo email address' };
-  }
-  return { ok: true, email: raw, normalizedEmail: `${normalizedLocal}@${domain}` };
-}
-
-function normalizeBetaLead(fields: Record<string, string>):
-  | {
-      ok: true;
-      lead: {
-        normalized_email: string;
-        email: string;
-        full_name: string;
-        company: string;
-        budget: string;
-      };
-    }
-  | { ok: false; error: string } {
-  const fullName = normalizeTextField(fields.fullName, 120);
-  const company = normalizeTextField(fields.company, 120);
-  const budget = normalizeTextField(fields.budget, 40);
-  if (fullName.length < 2) return { ok: false, error: 'full name is required' };
-  const email = normalizeBetaEmail(fields.email);
-  if (!email.ok) return { ok: false, error: email.error };
-  if (company.length < 2) return { ok: false, error: 'company is required' };
-  if (!BETA_BUDGETS.has(budget)) return { ok: false, error: 'choose a valid budget range' };
-  return {
-    ok: true,
-    lead: {
-      normalized_email: email.normalizedEmail,
-      email: email.email,
-      full_name: fullName,
-      company,
-      budget,
-    },
-  };
-}
-
 export function registerRoutes(app: FastifyInstance, env: Env, deps: RouteDeps): void {
-  const { slideStorage, audioFanout } = deps;
+  const { slideStorage, audioFanout, wakeSlideCleanup } = deps;
   const publicGetLimiter = createFixedWindow({
     windowMs: PUBLIC_GET_WINDOW_MS,
     max: env.PUBLIC_GET_MAX,
   });
-  const auditSalt = env.ADMIN_SECRET;
-
-  function auditHash(value: string): string {
-    return sha256Hex(`${auditSalt}:${value}`);
-  }
-
-  function trialIpHash(req: FastifyRequest): string {
-    return auditHash(clientIp(req));
-  }
-
-  function recordTrialAudit(req: FastifyRequest, row: {
-    flow: 'try' | 'beta';
-    allowed: boolean;
-    reason: string;
-    email?: string;
-    normalizedEmail?: string;
-    keyHashPrefix?: string;
-    sessionSlug?: string | null;
-    statusCode?: number | null;
-    detail?: string;
-  }): void {
-    recordTrialAbuseEvent({
-      flow: row.flow,
-      allowed: row.allowed,
-      reason: row.reason,
-      ip_hash: trialIpHash(req),
-      email: row.email,
-      normalized_email: row.normalizedEmail,
-      key_hash_prefix: row.keyHashPrefix,
-      session_slug: row.sessionSlug,
-      status_code: row.statusCode,
-      detail: row.detail,
-    });
-  }
-
-  function consumeTrialCreateLimit(req: FastifyRequest, flow: 'try' | 'beta'): { allowed: boolean; retryAfterSec: number } {
-    const limited = consumeTrialRateLimit({
-      scope: `trial_create:${flow}:ip`,
-      key_hash: trialIpHash(req),
-      window_ms: TRIAL_CREATE_WINDOW_MS,
-      max: TRIAL_CREATE_MAX_PER_WINDOW,
-    });
-    return {
-      allowed: limited.allowed,
-      retryAfterSec: Math.max(1, Math.ceil((limited.resetAtMs - Date.now()) / 1000)),
-    };
-  }
   /** Admin guard: Bearer token, timing-safe compare, rate-limited failures. */
   function requireAdmin(req: FastifyRequest, reply: FastifyReply): boolean {
     const ip = clientIp(req);
-    if (isRateLimited(ip)) {
-      reply.code(429).send({ error: 'too many failed auth attempts, try again in a minute' });
-      return false;
-    }
     const header = req.headers.authorization ?? '';
     const token = header.startsWith('Bearer ') ? header.slice(7) : undefined;
     if (!checkAdminSecret(token, env.ADMIN_SECRET)) {
-      recordAuthFailure(ip);
+      if (isRateLimited(ip, 'http')) {
+        reply.code(429).send({ error: 'too many failed auth attempts, try again in a minute' });
+        return false;
+      }
+      recordAuthFailure(ip, 'http');
       reply.code(401).send({ error: 'unauthorized' });
       return false;
     }
     return true;
-  }
-
-  /** Authorize an action on a specific session: the shared admin secret, OR
-   *  (for trial sessions) the per-session host token. */
-  function authorizeSession(req: FastifyRequest, reply: FastifyReply, slug: string): boolean {
-    const ip = clientIp(req);
-    if (isRateLimited(ip)) {
-      reply.code(429).send({ error: 'too many failed auth attempts, try again in a minute' });
-      return false;
-    }
-    const header = req.headers.authorization ?? '';
-    const token = header.startsWith('Bearer ') ? header.slice(7) : undefined;
-    if (checkAdminSecret(token, env.ADMIN_SECRET)) return true;
-    const trial = getTrial(slug);
-    if (trial && checkAdminSecret(token, trial.hostToken)) return true;
-    recordAuthFailure(ip);
-    reply.code(401).send({ error: 'unauthorized' });
-    return false;
   }
 
   /** Per-IP throttle for unauthenticated public reads. Returns false (and sends
@@ -380,8 +172,7 @@ export function registerRoutes(app: FastifyInstance, env: Env, deps: RouteDeps):
    */
   async function parseSessionForm(
     req: FastifyRequest,
-    reply: FastifyReply,
-    opts: ParseSessionFormOptions = {}
+    reply: FastifyReply
   ): Promise<ParsedSessionForm | null> {
     const fields: Record<string, string> = {};
     let upload: TempUpload | null = null;
@@ -411,14 +202,6 @@ export function registerRoutes(app: FastifyInstance, env: Env, deps: RouteDeps):
               await fsp.unlink(tmpPath).catch(() => {});
               reply.code(400).send({ error: 'upload failed' });
               return null;
-            }
-            if (opts.maxPdfBytes !== undefined) {
-              const stat = await fsp.stat(tmpPath).catch(() => null);
-              if (!stat || stat.size > opts.maxPdfBytes) {
-                await fsp.unlink(tmpPath).catch(() => {});
-                reply.code(400).send({ error: 'PDF uploads must be 5 MB or smaller for beta trials' });
-                return null;
-              }
             }
             if (!(await isPdfFile(tmpPath))) {
               await fsp.unlink(tmpPath).catch(() => {});
@@ -499,7 +282,16 @@ export function registerRoutes(app: FastifyInstance, env: Env, deps: RouteDeps):
     try {
       getDb().prepare('SELECT 1').get();
       await fsp.access(env.UPLOADS_DIR, fs.constants.W_OK);
-      return { ok: true };
+      const maintenance = inspectDatabaseMaintenance();
+      const degraded = maintenance.pendingSlideDeletionCount > 0 || maintenance.compactionPending;
+      return {
+        ok: true,
+        maintenance: {
+          status: degraded ? 'degraded' : 'ok',
+          pendingSlideDeletions: maintenance.pendingSlideDeletionCount,
+          compactionPending: maintenance.compactionPending,
+        },
+      };
     } catch {
       reply.code(503).send({ ok: false });
     }
@@ -509,11 +301,6 @@ export function registerRoutes(app: FastifyInstance, env: Env, deps: RouteDeps):
     if (!allowPublicGet(req, reply)) return;
     return SUPPORTED_LANGUAGES;
   });
-
-  async function cleanupTrialSession(slug: string): Promise<void> {
-    const removed = deleteSession(slug);
-    if (removed) await slideStorage.remove(removed.slide_ref);
-  }
 
   /** Admin key check — lets the client validate the key once on gate entry. */
   app.post('/api/auth/check', async (req, reply) => {
@@ -543,10 +330,18 @@ export function registerRoutes(app: FastifyInstance, env: Env, deps: RouteDeps):
     const parsed = await parseSessionForm(req, reply);
     if (!parsed) return;
     const { fields } = parsed;
+    const hasUploadedDeck = parsed.upload !== null;
     let slideRef = '';
 
     try {
       slideRef = await finalizeParsedUpload(parsed);
+      if (hasUploadedDeck) {
+        // Reserve the finalized object before the session insert. Both this
+        // queue write and createSession's attach/clear transaction are
+        // synchronous, so the in-process worker cannot observe the brief gap.
+        // A crash or failed insert therefore leaves durable cleanup work.
+        queuePendingSlideDeletion(slideRef);
+      }
       const slug = nanoid(8);
       const session = createSession({
         slug,
@@ -566,375 +361,41 @@ export function registerRoutes(app: FastifyInstance, env: Env, deps: RouteDeps):
       };
     } catch (err) {
       await cleanupParsedUpload(parsed);
-      await slideStorage.remove(slideRef);
-      throw err;
-    }
-  });
-
-  /**
-   * Self-serve trial (/try): NO admin secret. The visitor supplies their own
-   * `geminiApiKey` field, which is kept only in memory (never stored or logged)
-   * and used solely for this session's translation. Returns a per-session
-   * `hostToken` that the host console uses instead of ADMIN_SECRET. Viewers are
-   * capped at 10, and the live trial runtime is capped server-side.
-   */
-  app.post('/api/try', async (req, reply) => {
-    const createLimit = consumeTrialCreateLimit(req, 'try');
-    if (!createLimit.allowed) {
-      recordTrialAudit(req, {
-        flow: 'try',
-        allowed: false,
-        reason: 'rate_limited_ip',
-        statusCode: 429,
-      });
-      reply.header('Retry-After', String(createLimit.retryAfterSec));
-      reply.code(429).send({ error: 'too many trial attempts, try again in a minute' });
-      return;
-    }
-    const parsed = await parseSessionForm(req, reply);
-    if (!parsed) {
-      recordTrialAudit(req, {
-        flow: 'try',
-        allowed: false,
-        reason: 'invalid_form',
-        statusCode: reply.statusCode >= 400 ? reply.statusCode : 400,
-      });
-      return;
-    }
-    const { fields } = parsed;
-
-    const geminiKey = (fields.geminiApiKey ?? '').trim();
-    const auditKeyHash = geminiKey ? keyHashPrefix(geminiKey) : '';
-    const email = auditEmail(fields.email);
-    if (geminiKey.length < 8) {
-      await cleanupParsedUpload(parsed);
-      recordTrialAudit(req, {
-        flow: 'try',
-        allowed: false,
-        reason: 'invalid_key_format',
-        email,
-        normalizedEmail: email,
-        keyHashPrefix: auditKeyHash,
-        statusCode: 400,
-      });
-      reply.code(400).send({ error: 'a Gemini API key is required to start a trial' });
-      return;
-    }
-
-    if (env.VALIDATE_TRIAL_GEMINI_KEYS) {
-      const validation = await validateGeminiLiveKey(
-        geminiKey,
-        fields.targetLang,
-        fields.echoTargetLanguage === 'true'
-      );
-      if (!validation.ok) {
-        await cleanupParsedUpload(parsed);
-        const statusCode = validation.reason === 'invalid' ? 400 : 503;
-        recordTrialAudit(req, {
-          flow: 'try',
-          allowed: false,
-          reason: validation.reason === 'invalid' ? 'invalid_gemini_key' : 'gemini_validation_failed',
-          email,
-          normalizedEmail: email,
-          keyHashPrefix: auditKeyHash,
-          statusCode,
-          detail: validation.reason,
-        });
-        reply.code(statusCode).send({ error: validation.message });
-        return;
+      if (hasUploadedDeck && slideRef) {
+        let cleanupQueued = false;
+        let queueFailed = false;
+        try {
+          // Also rechecks whether the insert actually attached the ref. Never
+          // remove an object now referenced by a committed session.
+          cleanupQueued = queuePendingSlideDeletion(slideRef);
+        } catch (queueErr) {
+          queueFailed = true;
+          app.log.warn({ err: queueErr }, 'failed to queue uploaded deck cleanup');
+        }
+        if (cleanupQueued || queueFailed) {
+          try {
+            if (await slideStorage.remove(slideRef)) {
+              if (cleanupQueued) completePendingSlideDeletion(slideRef);
+            } else if (cleanupQueued) {
+              wakeSlideCleanup();
+            } else {
+              app.log.error(
+                'uploaded deck cleanup failed after its durable queue write also failed; operator action required'
+              );
+            }
+          } catch (cleanupErr) {
+            app.log.warn(
+              { err: cleanupErr },
+              cleanupQueued
+                ? 'uploaded deck cleanup failed; retry remains queued'
+                : 'uploaded deck cleanup and durable queue write both failed; operator action required'
+            );
+            if (cleanupQueued) wakeSlideCleanup();
+          }
+        }
       }
-    }
-
-    const slug = nanoid(8);
-    const hostToken = nanoid(32);
-    if (!registerTrial(slug, {
-      geminiKey,
-      hostToken,
-      maxViewers: TRY_MAX_VIEWERS,
-      ttlMs: env.TRIAL_TTL_MS,
-      runtimeMs: TRY_RUNTIME_MS,
-      onExpire: cleanupTrialSession,
-    })) {
-      await cleanupParsedUpload(parsed);
-      recordTrialAudit(req, {
-        flow: 'try',
-        allowed: false,
-        reason: 'active_trial_capacity',
-        email,
-        normalizedEmail: email,
-        keyHashPrefix: auditKeyHash,
-        statusCode: 503,
-      });
-      reply.code(503).send({ error: 'too many active trials right now — please try again shortly' });
-      return;
-    }
-
-    let slideRef = '';
-    try {
-      slideRef = await finalizeParsedUpload(parsed);
-      createSession({
-        slug,
-        title: (fields.title ?? '').slice(0, 200),
-        target_lang: fields.targetLang,
-        slide_type: fields.slideType,
-        slide_ref: slideRef,
-        slide_count: parsed.slideCount,
-        echo_target_language: fields.echoTargetLanguage === 'true',
-        presentation_mode: fields.presentationMode === 'remote' ? 'remote' : 'in_person',
-        is_trial: true,
-        trial_type: 'try',
-      });
-      recordTrialAudit(req, {
-        flow: 'try',
-        allowed: true,
-        reason: 'created',
-        email,
-        normalizedEmail: email,
-        keyHashPrefix: auditKeyHash,
-        sessionSlug: slug,
-        statusCode: 200,
-      });
-    } catch (err) {
-      unregisterTrial(slug);
-      await cleanupParsedUpload(parsed);
-      await slideStorage.remove(slideRef);
-      recordTrialAudit(req, {
-        flow: 'try',
-        allowed: false,
-        reason: 'server_error',
-        email,
-        normalizedEmail: email,
-        keyHashPrefix: auditKeyHash,
-        statusCode: 500,
-      });
       throw err;
     }
-
-    return {
-      slug,
-      hostToken,
-      viewerPath: `/${slug}`,
-      hostPath: `/${slug}/host`,
-    };
-  });
-
-  /**
-   * Hosted beta trial (/beta): first-party, no user key. Uses the server-side
-   * GEMINI_API_KEY, stores lead details durably, and allows one successful
-   * beta trial ever per normalized email. The host token is returned only in
-   * the JSON body for sessionStorage handoff by the creator.
-   */
-  app.post('/api/beta/trial', async (req, reply) => {
-    const createLimit = consumeTrialCreateLimit(req, 'beta');
-    if (!createLimit.allowed) {
-      recordTrialAudit(req, {
-        flow: 'beta',
-        allowed: false,
-        reason: 'rate_limited_ip',
-        statusCode: 429,
-      });
-      reply.header('Retry-After', String(createLimit.retryAfterSec));
-      reply.code(429).send({ error: 'too many beta trial attempts, try again in a minute' });
-      return;
-    }
-    const parsed = await parseSessionForm(req, reply, { maxPdfBytes: BETA_PDF_MAX_BYTES });
-    if (!parsed) {
-      recordTrialAudit(req, {
-        flow: 'beta',
-        allowed: false,
-        reason: 'invalid_form',
-        statusCode: reply.statusCode >= 400 ? reply.statusCode : 400,
-      });
-      return;
-    }
-    const { fields } = parsed;
-    const lead = normalizeBetaLead(fields);
-    if (!lead.ok) {
-      await cleanupParsedUpload(parsed);
-      const email = auditEmail(fields.email);
-      recordTrialAudit(req, {
-        flow: 'beta',
-        allowed: false,
-        reason: 'invalid_lead',
-        email,
-        normalizedEmail: email,
-        statusCode: 400,
-        detail: lead.error,
-      });
-      reply.code(400).send({ error: lead.error });
-      return;
-    }
-    if (!env.GEMINI_API_KEY.trim()) {
-      await cleanupParsedUpload(parsed);
-      recordTrialAudit(req, {
-        flow: 'beta',
-        allowed: false,
-        reason: 'hosted_key_unavailable',
-        email: lead.lead.email,
-        normalizedEmail: lead.lead.normalized_email,
-        statusCode: 503,
-      });
-      reply.code(503).send({ error: 'hosted beta trials are not available right now' });
-      return;
-    }
-    if (getBetaLeadByNormalizedEmail(lead.lead.normalized_email)) {
-      recordBetaLeadDuplicate(lead.lead.normalized_email);
-      await cleanupParsedUpload(parsed);
-      recordTrialAudit(req, {
-        flow: 'beta',
-        allowed: false,
-        reason: 'duplicate_email',
-        email: lead.lead.email,
-        normalizedEmail: lead.lead.normalized_email,
-        statusCode: 409,
-      });
-      reply.code(409).send({ error: 'a beta trial has already been used for this email address' });
-      return;
-    }
-
-    const slug = nanoid(8);
-    const hostToken = nanoid(32);
-    if (!registerTrial(slug, {
-      geminiKey: env.GEMINI_API_KEY,
-      hostToken,
-      maxViewers: BETA_MAX_VIEWERS,
-      ttlMs: env.TRIAL_TTL_MS,
-      runtimeMs: BETA_RUNTIME_MS,
-      onExpire: cleanupTrialSession,
-    })) {
-      await cleanupParsedUpload(parsed);
-      recordTrialAudit(req, {
-        flow: 'beta',
-        allowed: false,
-        reason: 'active_trial_capacity',
-        email: lead.lead.email,
-        normalizedEmail: lead.lead.normalized_email,
-        statusCode: 503,
-      });
-      reply.code(503).send({ error: 'too many active trials right now — please try again shortly' });
-      return;
-    }
-
-    let slideRef = '';
-    try {
-      slideRef = await finalizeParsedUpload(parsed);
-      createBetaTrialSession({
-        session: {
-          slug,
-          title: (fields.title ?? '').slice(0, 200),
-          target_lang: fields.targetLang,
-          slide_type: fields.slideType,
-          slide_ref: slideRef,
-          slide_count: parsed.slideCount,
-          echo_target_language: fields.echoTargetLanguage === 'true',
-          presentation_mode: fields.presentationMode === 'remote' ? 'remote' : 'in_person',
-        },
-        lead: lead.lead,
-      });
-      recordTrialAudit(req, {
-        flow: 'beta',
-        allowed: true,
-        reason: 'created',
-        email: lead.lead.email,
-        normalizedEmail: lead.lead.normalized_email,
-        sessionSlug: slug,
-        statusCode: 200,
-      });
-    } catch (err) {
-      unregisterTrial(slug);
-      await cleanupParsedUpload(parsed);
-      await slideStorage.remove(slideRef);
-      if (getBetaLeadByNormalizedEmail(lead.lead.normalized_email)) {
-        recordBetaLeadDuplicate(lead.lead.normalized_email);
-        recordTrialAudit(req, {
-          flow: 'beta',
-          allowed: false,
-          reason: 'duplicate_email',
-          email: lead.lead.email,
-          normalizedEmail: lead.lead.normalized_email,
-          statusCode: 409,
-        });
-        reply.code(409).send({ error: 'a beta trial has already been used for this email address' });
-        return;
-      }
-      recordTrialAudit(req, {
-        flow: 'beta',
-        allowed: false,
-        reason: 'server_error',
-        email: lead.lead.email,
-        normalizedEmail: lead.lead.normalized_email,
-        statusCode: 500,
-      });
-      throw err;
-    }
-
-    return {
-      slug,
-      hostToken,
-      viewerPath: `/${slug}`,
-      hostPath: `/${slug}/host`,
-    };
-  });
-
-  app.post('/api/beta/trial/:slug/expedite', async (req, reply) => {
-    const { slug } = req.params as { slug: string };
-    if (!SLUG_ALPHABET_RE.test(slug)) {
-      reply.code(400).send({ error: 'bad slug' });
-      return;
-    }
-    if (!authorizeSession(req, reply, slug)) return;
-    const session = getSessionBySlug(slug);
-    if (!session || session.trial_type !== 'beta') {
-      reply.code(404).send({ error: 'beta trial not found' });
-      return;
-    }
-    const lead = recordBetaLeadExpedite(slug);
-    if (!lead) {
-      reply.code(404).send({ error: 'beta lead not found' });
-      return;
-    }
-    return {
-      ok: true,
-      expediteRequested: lead.expedite_requested === 1,
-      expediteRequestedAt: lead.expedite_requested_at,
-    };
-  });
-
-  app.post('/api/beta/trial/:slug/feedback', async (req, reply) => {
-    const { slug } = req.params as { slug: string };
-    if (!SLUG_ALPHABET_RE.test(slug)) {
-      reply.code(400).send({ error: 'bad slug' });
-      return;
-    }
-    if (!authorizeSession(req, reply, slug)) return;
-    const session = getSessionBySlug(slug);
-    if (!session || session.trial_type !== 'beta') {
-      reply.code(404).send({ error: 'beta trial not found' });
-      return;
-    }
-    const body = (req.body ?? {}) as { rating?: unknown; feedback?: unknown };
-    const rating =
-      typeof body.rating === 'number' && Number.isInteger(body.rating) ? body.rating : NaN;
-    if (rating < 1 || rating > 5) {
-      reply.code(400).send({ error: 'rating must be an integer from 1 to 5' });
-      return;
-    }
-    const feedback = normalizeTextField(typeof body.feedback === 'string' ? body.feedback : '', 2000);
-    const lead = recordBetaLeadFeedback({
-      session_slug: slug,
-      rating,
-      feedback_text: feedback,
-    });
-    if (!lead) {
-      reply.code(404).send({ error: 'beta lead not found' });
-      return;
-    }
-    return {
-      ok: true,
-      rating: lead.feedback_rating,
-      feedback: lead.feedback_text,
-      feedbackSubmittedAt: lead.feedback_submitted_at,
-    };
   });
 
   /** Public session info for viewer/host pages. Never includes secrets. */
@@ -967,19 +428,6 @@ export function registerRoutes(app: FastifyInstance, env: Env, deps: RouteDeps):
       startedAt: session.started_at,
       endedAt: session.ended_at,
       presentationMode: session.presentation_mode,
-      trialKind: session.trial_type === 'beta' || session.trial_type === 'try' ? session.trial_type : null,
-      trialRuntimeMs:
-        session.trial_type === 'beta'
-          ? BETA_RUNTIME_MS
-          : session.trial_type === 'try'
-            ? TRY_RUNTIME_MS
-            : null,
-      trialMaxViewers:
-        session.trial_type === 'beta'
-          ? BETA_MAX_VIEWERS
-          : session.trial_type === 'try'
-            ? TRY_MAX_VIEWERS
-            : null,
       audio: audioFanout.infoForSession(session),
     };
   });
@@ -1071,7 +519,7 @@ export function registerRoutes(app: FastifyInstance, env: Env, deps: RouteDeps):
   app.get('/api/sessions/:slug/analytics', async (req, reply) => {
     reply.header('Cache-Control', 'no-store');
     const { slug } = req.params as { slug: string };
-    if (!authorizeSession(req, reply, slug)) return;
+    if (!requireAdmin(req, reply)) return;
     const session = getSessionBySlug(slug);
     if (!session) {
       reply.code(404).send({ error: 'session not found' });
@@ -1129,30 +577,6 @@ export function registerRoutes(app: FastifyInstance, env: Env, deps: RouteDeps):
     }));
   });
 
-  /** Admin-only: durable hosted-beta leads, including duplicate attempts. */
-  app.get('/api/beta/leads', async (req, reply) => {
-    if (!requireAdmin(req, reply)) return;
-    return getBetaLeads().map((lead) => ({
-      id: lead.id,
-      email: lead.email,
-      normalizedEmail: lead.normalized_email,
-      fullName: lead.full_name,
-      company: lead.company,
-      budget: lead.budget,
-      sessionSlug: lead.session_slug,
-      duplicateAttempts: lead.duplicate_attempts,
-      expediteRequested: lead.expedite_requested === 1,
-      expediteRequestedAt: lead.expedite_requested_at,
-      feedbackRating: lead.feedback_rating,
-      feedback: lead.feedback_text,
-      feedbackSubmittedAt: lead.feedback_submitted_at,
-      firstTrialAt: lead.first_trial_at,
-      lastDuplicateAt: lead.last_duplicate_at,
-      createdAt: lead.created_at,
-      updatedAt: lead.updated_at,
-    }));
-  });
-
   /** Admin-only: edit a talk's title / target language / echo toggle. */
   app.patch('/api/sessions/:slug', async (req, reply) => {
     if (!requireAdmin(req, reply)) return;
@@ -1195,8 +619,13 @@ export function registerRoutes(app: FastifyInstance, env: Env, deps: RouteDeps):
       reply.code(404).send({ error: 'session not found' });
       return;
     }
-    // Clean up an uploaded PDF (ignore external URLs, legacy HTML, and missing files).
-    await slideStorage.remove(removed.slide_ref);
-    return { ok: true };
+    // Object deletion is durable, asynchronous maintenance. The database row
+    // is already gone, so storage degradation must not turn this into a 503.
+    if (removed.cleanup_pending) {
+      wakeSlideCleanup();
+      reply.code(202).send({ ok: true, cleanupPending: true });
+      return;
+    }
+    return { ok: true, cleanupPending: false };
   });
 }

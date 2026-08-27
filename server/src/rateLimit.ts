@@ -1,7 +1,7 @@
 /**
  * rateLimit.ts — tiny in-process fixed-window limiter, the same pattern already
- * used for auth failures (auth.ts) and /try attempts (routes.ts), factored out
- * so HTTP and WS paths can share it. Single-instance only (state lives in a Map,
+ * used for public-read and authentication throttles, factored out so HTTP and
+ * WS paths can share it. Single-instance only (state lives in a Map,
  * which is fine: the deploy is pinned to one process — see render.yaml).
  */
 

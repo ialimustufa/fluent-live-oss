@@ -12,8 +12,13 @@ import type { Server, IncomingMessage } from 'node:http';
 import type { Duplex } from 'node:stream';
 import crypto from 'node:crypto';
 import { checkAdminSecret, isRateLimited, recordAuthFailure } from './auth.js';
-import { getOrCreateRoom, getTrial, type Room } from './rooms.js';
-import { envelope, type Envelope, type HelloPayload } from './types.js';
+import { getOrCreateRoom, type Room } from './rooms.js';
+import {
+  envelope,
+  type ConnectionSnapshotPayload,
+  type Envelope,
+  type HelloPayload,
+} from './types.js';
 
 const HELLO_TIMEOUT_MS = 10_000;
 const MAX_WS_PAYLOAD_BYTES = 256 * 1024;
@@ -97,6 +102,13 @@ function normalizeProfileText(value: unknown): string {
   return value.replace(TEXT_CONTROL_RE, '').trim().slice(0, MAX_PROFILE_TEXT_CHARS);
 }
 
+function snapshotForConnection(room: Room, canPresent: boolean): ConnectionSnapshotPayload {
+  return {
+    ...room.snapshotFor(),
+    canPresent,
+  };
+}
+
 function handleConnection(
   ws: WebSocket,
   req: IncomingMessage,
@@ -137,18 +149,13 @@ function handleConnection(
       const payload = (msg.payload ?? {}) as HelloPayload;
 
       if (payload.role === 'host') {
-        if (isRateLimited(ip)) {
-          ws.close(4429, 'rate limited');
-          return;
-        }
-        // Trial sessions authenticate the host with their per-session token;
-        // everything else requires the shared ADMIN_SECRET.
-        const trial = getTrial(slug);
-        const ok = trial
-          ? checkAdminSecret(payload.auth, trial.hostToken)
-          : checkAdminSecret(payload.auth, adminSecret);
+        const ok = checkAdminSecret(payload.auth, adminSecret);
         if (!ok) {
-          recordAuthFailure(ip);
+          if (isRateLimited(ip, 'host')) {
+            ws.close(4429, 'rate limited');
+            return;
+          }
+          recordAuthFailure(ip, 'host');
           ws.close(4401, 'unauthorized');
           return;
         }
@@ -158,7 +165,7 @@ function handleConnection(
           room.host.close(4000, 'replaced by new host connection');
         }
         room.host = ws;
-        ws.send(envelope('snapshot', room.nextSeq(), room.snapshotFor()));
+        ws.send(envelope('snapshot', room.nextSeq(), snapshotForConnection(room, true)));
         room.sendToHost('presence', { viewerCount: room.viewers.size });
       } else if (payload.role === 'viewer') {
         // Enforce the viewer cap configured for this room.
@@ -166,23 +173,27 @@ function handleConnection(
           ws.close(4409, 'viewer limit reached');
           return;
         }
-        role = 'viewer';
-        // Grant slide control to a viewer that supplied a valid presenter token
-        // (admin secret, or the trial host token). No auth failure is recorded:
-        // ordinary viewers send none and stay read-only.
-        if (typeof payload.auth === 'string' && payload.auth) {
-          const trial = getTrial(slug);
-          canPresent = trial
-            ? checkAdminSecret(payload.auth, trial.hostToken)
-            : checkAdminSecret(payload.auth, adminSecret);
+        // A stage that presents a nonempty key is making an authentication
+        // attempt. Ordinary viewers send no key, remain read-only, and never
+        // consume the failed-auth budget.
+        if (typeof payload.auth === 'string' && payload.auth.length > 0) {
+          canPresent = checkAdminSecret(payload.auth, adminSecret);
+          if (!canPresent) {
+            if (isRateLimited(ip, 'presenter')) {
+              ws.close(4429, 'rate limited');
+              return;
+            }
+            recordAuthFailure(ip, 'presenter');
+          }
         }
+        role = 'viewer';
         room.viewers.add(ws);
         room.recordViewerJoin(ws, {
           viewerId: normalizeViewerId(payload.viewerId),
           name: normalizeProfileText(payload.name),
           company: normalizeProfileText(payload.company),
         });
-        ws.send(envelope('snapshot', room.nextSeq(), room.snapshotFor()));
+        ws.send(envelope('snapshot', room.nextSeq(), snapshotForConnection(room, canPresent)));
         room.sendToHost('presence', { viewerCount: room.viewers.size });
       } else {
         ws.close(4403, 'invalid role');
