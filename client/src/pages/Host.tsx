@@ -699,9 +699,17 @@ function HostInner() {
             : 'bg-[var(--surface-2)] text-[var(--muted)] ring-[var(--border)]';
 
   return (
-    <div className="flex h-screen bg-[var(--bg)]">
+    <div
+      className={`flex h-screen bg-[var(--bg)] ${
+        session.audienceEnabled ? '' : 'flex-col md:flex-row'
+      }`}
+    >
       {/* Main column: same layout as viewer */}
-      <div className="hidden min-w-0 flex-1 flex-col md:flex">
+      <div
+        className={`${
+          session.audienceEnabled ? 'hidden md:flex' : 'flex min-h-[40vh]'
+        } min-w-0 flex-1 flex-col`}
+      >
         <TranscriptBar lines={output.lines} label={session.targetLang} position="top" accent size="lg" />
         <div className="relative min-h-0 flex-1 bg-[var(--surface-2)]">
           <SlideViewer
@@ -726,7 +734,11 @@ function HostInner() {
       </div>
 
       {/* Control rail: pinned live-critical band + tabbed body */}
-      <aside className="glass-panel flex w-full shrink-0 flex-col text-[var(--fg)] md:w-[22rem] md:border-l md:border-[var(--border)]">
+      <aside
+        className={`glass-panel flex w-full shrink-0 flex-col text-[var(--fg)] md:w-[22rem] md:border-l md:border-[var(--border)] ${
+          session.audienceEnabled ? '' : 'min-h-0 flex-1 md:flex-none'
+        }`}
+      >
         {/* 1) Pinned band — transport + slide nav stay visible without scrolling */}
         <div className="shrink-0 space-y-3 border-b border-[var(--border)] p-4">
           <div className="flex items-start justify-between gap-2">

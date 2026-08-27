@@ -253,6 +253,23 @@ function handleHostMessage(
   // (slides, polls, control) so a flood of those can't overwhelm the room.
   if (msg.type !== 'audio.in' && !throttle()) return;
 
+  if (
+    !room.audienceEnabled &&
+    (msg.type === 'poll.open' ||
+      msg.type === 'poll.close' ||
+      msg.type === 'poll.pin' ||
+      msg.type === 'poll.hide' ||
+      msg.type === 'poll.delete')
+  ) {
+    ws.send(
+      envelope('error', room.nextSeq(), {
+        code: 'audience_disabled',
+        message: 'polls are disabled for speaker-only sessions',
+      })
+    );
+    return;
+  }
+
   switch (msg.type) {
     case 'audio.in': {
       const { data, clientSentAtMs } = (msg.payload ?? {}) as { data?: string; clientSentAtMs?: number };

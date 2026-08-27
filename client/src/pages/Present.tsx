@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Link, Navigate, useParams } from 'react-router-dom';
-import { MessageSquare, X, BarChart3, ChevronLeft, ChevronRight } from 'lucide-react';
+import { Link, useParams } from 'react-router-dom';
+import { MessageSquare, X, BarChart3, ChevronLeft, ChevronRight, Laptop2 } from 'lucide-react';
 import { fetchSession, type SessionInfo } from '../lib/api';
 import { SessionSocket, type SessionSnapshotPayload } from '../lib/ws';
 import { getAdminKey } from '../lib/adminKey';
@@ -16,6 +16,28 @@ import ThemeToggle from '../components/ThemeToggle';
 import QrCode from '../components/QrCode';
 import ReactionLayer from '../components/ReactionLayer';
 import PollResults from '../components/PollResults';
+
+function SpeakerOnlyStageNotice() {
+  return (
+    <div className="bg-aurora flex min-h-screen flex-col items-center justify-center gap-4 px-6 text-center">
+      <div className="animate-fade-up glass-panel flex max-w-md flex-col items-center gap-4 rounded-3xl px-10 py-12">
+        <div className="flex h-14 w-14 items-center justify-center rounded-[var(--r-lg)] bg-info-soft text-info ring-1 ring-inset ring-info">
+          <Laptop2 size={26} />
+        </div>
+        <h1 className="text-xl font-semibold text-[var(--fg)]">
+          No projector for this speaker-only session
+        </h1>
+        <p className="text-sm leading-relaxed text-[var(--muted)]">
+          Keep the speaker console open on the stage computer. Slides, captions, microphone, and
+          translated audio all stay on that one screen.
+        </p>
+        <Link to="/" className="btn-ghost rounded-xl px-6 py-2.5">
+          Back to Fluent
+        </Link>
+      </div>
+    </div>
+  );
+}
 
 /**
  * Stage / projector view. The presenter projects or screen-shares this: a
@@ -161,7 +183,7 @@ export default function Present() {
     return <div className="bg-aurora flex min-h-screen items-center justify-center text-[var(--faint)]">Loading…</div>;
   }
   if (session.audienceEnabled === false) {
-    return <Navigate replace to={`/${slug}/host`} />;
+    return <SpeakerOnlyStageNotice />;
   }
 
   const atStart = slideIndex <= 0;

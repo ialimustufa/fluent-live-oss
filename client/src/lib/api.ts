@@ -98,7 +98,16 @@ export async function fetchSession(slug: string, auth?: string): Promise<Session
 
 export async function fetchTranscript(slug: string, auth?: string): Promise<TranscriptData> {
   const res = await fetch(`/api/sessions/${slug}/transcript`, { headers: bearerHeaders(auth) });
-  if (!res.ok) throw new Error(`transcript not found (${res.status})`);
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({ error: `transcript not found (${res.status})` }));
+    const error = new Error(body.error ?? `transcript not found (${res.status})`) as Error & {
+      code?: string;
+      status?: number;
+    };
+    error.code = body.code;
+    error.status = res.status;
+    throw error;
+  }
   return res.json();
 }
 

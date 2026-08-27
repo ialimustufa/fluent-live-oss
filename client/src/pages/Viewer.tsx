@@ -57,7 +57,6 @@ export default function Viewer() {
   const { slug = '' } = useParams();
   const [session, setSession] = useState<SessionInfo | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [speakerOnly, setSpeakerOnly] = useState(false);
   const [profile, setProfile] = useState<ViewerProfile | null>(getViewerProfile);
   const [state, setState] = useState<string>('created');
   const [slideIndex, setSlideIndex] = useState(0);
@@ -115,17 +114,13 @@ export default function Viewer() {
     setMuted(true);
     setAudioError(null);
     setLoadError(null);
-    setSpeakerOnly(false);
     fetchSession(slug)
       .then((s) => {
         setSession(s);
         setState(s.state);
         setSlideIndex(s.slideIndex);
       })
-      .catch((e) => {
-        if ((e as { code?: string }).code === 'audience_disabled') setSpeakerOnly(true);
-        else setLoadError(String(e.message ?? e));
-      });
+      .catch((e) => setLoadError(String(e.message ?? e)));
   }, [slug]);
 
   useEffect(
@@ -299,7 +294,7 @@ export default function Viewer() {
       </div>
     );
   }
-  if (speakerOnly || session?.audienceEnabled === false) {
+  if (session?.audienceEnabled === false) {
     return <SpeakerOnlyNotice />;
   }
   if (!session) {

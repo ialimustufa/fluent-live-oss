@@ -1663,7 +1663,9 @@ let speakerSlug = '';
     body: JSON.stringify({
       title: 'Speaker-only Stage',
       targetLang: 'es',
-      presentationMode: 'in_person',
+      // The server owns this invariant: a client cannot create a remote
+      // speaker-only session even if it submits contradictory JSON directly.
+      presentationMode: 'remote',
       audienceEnabled: false,
       slideType: 'html',
       slideUrl: 'https://example.com/speaker-stage.html',
@@ -1852,6 +1854,24 @@ console.log('\n[9] WebSocket roles');
   check(
     'speaker-only host still receives a room snapshot',
     speakerHost.messages.some((message) => message.type === 'snapshot')
+  );
+  speakerHost.ws.send(JSON.stringify({
+    type: 'poll.open',
+    ts: 0,
+    seq: 0,
+    payload: { question: 'This must not persist', options: ['A', 'B'] },
+  }));
+  await new Promise((r) => setTimeout(r, 200));
+  const speakerPollsRes = await fetch(`${BASE}/api/sessions/${speakerSlug}/polls`, {
+    headers: { Authorization: `Bearer ${SECRET}` },
+  });
+  const speakerPollsBody = await speakerPollsRes.json();
+  check(
+    'speaker-only host poll commands are rejected without persistence',
+    speakerHost.messages.some(
+      (message) => message.type === 'error' && message.payload?.code === 'audience_disabled'
+    ) && speakerPollsBody.polls?.length === 0,
+    JSON.stringify({ messages: speakerHost.messages, polls: speakerPollsBody })
   );
   speakerViewer.ws.close();
   speakerHost.ws.close();

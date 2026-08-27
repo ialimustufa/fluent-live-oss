@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { fetchTranscript, fetchPolls, type TranscriptData, type TranscriptSegment, type PollResult } from '../lib/api';
+import { fetchSession, fetchTranscript, fetchPolls, type TranscriptData, type TranscriptSegment, type PollResult } from '../lib/api';
 import { getAdminKey } from '../lib/adminKey';
 import PollResults from '../components/PollResults';
+import AdminKeyGate from '../components/AdminKeyGate';
 
 function fmtOffset(ms: number): string {
   const s = Math.floor(ms / 1000);
@@ -24,15 +25,23 @@ function buildRows(segments: TranscriptSegment[]) {
   return [...bySlide.entries()].sort((a, b) => a[0] - b[0]);
 }
 
-export default function TranscriptPage() {
-  const { slug = '' } = useParams();
-  const auth = getAdminKey() ?? undefined;
+function TranscriptContent({
+  slug,
+  auth,
+}: {
+  slug: string;
+  auth?: string;
+}) {
   const [data, setData] = useState<TranscriptData | null>(null);
   const [polls, setPolls] = useState<PollResult[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    fetchTranscript(slug, auth).then(setData).catch((e) => setError(String(e.message ?? e)));
+    setData(null);
+    setError(null);
+    fetchTranscript(slug, auth)
+      .then(setData)
+      .catch((e) => setError(String(e.message ?? e)));
     fetchPolls(slug, auth).then(setPolls).catch(() => {});
   }, [auth, slug]);
 
@@ -128,4 +137,48 @@ export default function TranscriptPage() {
       </div>
     </div>
   );
+}
+
+function AuthenticatedTranscript({ slug }: { slug: string }) {
+  return <TranscriptContent slug={slug} auth={getAdminKey() ?? undefined} />;
+}
+
+export default function TranscriptPage() {
+  const { slug = '' } = useParams();
+  const [audienceEnabled, setAudienceEnabled] = useState<boolean | null>(null);
+  const [sessionError, setSessionError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setAudienceEnabled(null);
+    setSessionError(null);
+    fetchSession(slug)
+      .then((session) => setAudienceEnabled(session.audienceEnabled))
+      .catch((e) => setSessionError(String(e.message ?? e)));
+  }, [slug]);
+
+  if (sessionError) {
+    return (
+      <div className="bg-aurora flex min-h-screen items-center justify-center text-[var(--muted)]">
+        Session not found.
+      </div>
+    );
+  }
+
+  if (audienceEnabled === null) {
+    return (
+      <div className="bg-aurora flex min-h-screen items-center justify-center text-[var(--faint)]">
+        Loading…
+      </div>
+    );
+  }
+
+  if (!audienceEnabled) {
+    return (
+      <AdminKeyGate>
+        <AuthenticatedTranscript slug={slug} />
+      </AdminKeyGate>
+    );
+  }
+
+  return <TranscriptContent slug={slug} />;
 }

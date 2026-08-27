@@ -373,6 +373,7 @@ export function registerRoutes(app: FastifyInstance, env: Env, deps: RouteDeps):
         queuePendingSlideDeletion(slideRef);
       }
       const slug = nanoid(8);
+      const audienceEnabled = fields.audienceEnabled !== 'false';
       const session = createSession({
         slug,
         title: (fields.title ?? '').slice(0, 200),
@@ -381,8 +382,9 @@ export function registerRoutes(app: FastifyInstance, env: Env, deps: RouteDeps):
         slide_ref: slideRef,
         slide_count: parsed.slideCount,
         echo_target_language: fields.echoTargetLanguage === 'true',
-        presentation_mode: fields.presentationMode === 'remote' ? 'remote' : 'in_person',
-        audience_enabled: fields.audienceEnabled !== 'false',
+        presentation_mode:
+          audienceEnabled && fields.presentationMode === 'remote' ? 'remote' : 'in_person',
+        audience_enabled: audienceEnabled,
       });
 
       return {
