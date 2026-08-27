@@ -1,0 +1,56 @@
+services:
+  - type: web
+    name: fluent
+    runtime: node
+    plan: starter
+    # Single instance is required: WS rooms and the Gemini session live in
+    # process memory, and the persistent disk pins us to one instance anyway.
+    numInstances: 1
+    autoDeployTrigger: off
+    # --include=dev: Render sets NODE_ENV=production, which would otherwise make
+    # npm skip devDependencies (vite, typescript, tailwind) and fail the build.
+    buildCommand: npm ci --include=dev && npm run build && npm run upload:assets
+    startCommand: npm start
+    healthCheckPath: /healthz
+    disk:
+      name: fluent-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      # Pin Node so better-sqlite3 gets a matching prebuilt binary (must match .nvmrc).
+      - key: NODE_VERSION
+        value: "24"
+      - key: NODE_ENV
+        value: production
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: ADMIN_SECRET
+        sync: false
+      # Set to the browser-visible Render/custom-domain origin in the dashboard.
+      - key: PUBLIC_ORIGIN
+        sync: false
+      # Render is the trusted ingress and owns X-Forwarded-For.
+      - key: TRUST_PROXY
+        value: "true"
+      - key: DATABASE_PATH
+        value: /data/app.db
+      - key: UPLOADS_DIR
+        value: /data/uploads
+      - key: AUDIO_SUBSCRIPTION_ACTIVE
+        sync: false
+      - key: CF_REALTIME_APP_ID
+        sync: false
+      - key: CF_REALTIME_APP_SECRET
+        sync: false
+      - key: R2_ACCOUNT_ID
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET
+        sync: false
+      - key: R2_PUBLIC_BASE_URL
+        sync: false
+      - key: ASSET_CDN_BASE_URL
+        sync: false

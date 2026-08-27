@@ -1,0 +1,41 @@
+{
+  "name": "fluent",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Fluent — real-time translated presentation platform",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ialimustufa/fluent-live-oss.git"
+  },
+  "homepage": "https://github.com/ialimustufa/fluent-live-oss#readme",
+  "bugs": {
+    "url": "https://github.com/ialimustufa/fluent-live-oss/issues"
+  },
+  "workspaces": [
+    "server",
+    "client"
+  ],
+  "scripts": {
+    "dev": "concurrently -n server,client -c blue,green \"npm run dev -w server\" \"npm run dev -w client\"",
+    "build": "npm run build -w client && npm run build -w server",
+    "start": "node server/dist/index.js",
+    "release:check": "node scripts/public-release-check.mjs",
+    "typecheck": "npm run typecheck -w server && npm run typecheck -w client",
+    "smoke": "node scripts/smoke.mjs",
+    "browser:smoke": "node scripts/browser-smoke.mjs",
+    "preflight": "node server/dist/preflight.js",
+    "verify": "npm run release:check && npm run typecheck && npm run build && npm run preflight && npm audit && npm run smoke && npm run browser:smoke",
+    "backup": "node scripts/backup.mjs",
+    "restore": "node scripts/restore.mjs",
+    "upload:assets": "node scripts/upload-assets-to-r2.mjs",
+    "check:sfu": "node scripts/check-sfu.mjs"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.3",
+    "playwright": "^1.61.0"
+  },
+  "engines": {
+    "node": ">=24 <25"
+  }
+}
