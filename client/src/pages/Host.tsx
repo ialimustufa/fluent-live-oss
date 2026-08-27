@@ -15,7 +15,7 @@ import {
   type SessionInfo,
   type Analytics,
 } from '../lib/api';
-import { getAdminKey } from '../lib/adminKey';
+import { clearAdminKey, getAdminKey } from '../lib/adminKey';
 import { SessionSocket } from '../lib/ws';
 import { MicCapture, listAudioDevices, DSP_OFF, type DspConfig } from '../lib/audio-capture';
 import { TranslatedAudioPlayer } from '../lib/audio-playback';
@@ -104,6 +104,7 @@ function HostInner() {
   const [analyticsUpdatedAt, setAnalyticsUpdatedAt] = useState<number | null>(null);
   const [audioError, setAudioError] = useState<string | null>(null);
   const [translationError, setTranslationError] = useState<string | null>(null);
+  const [hostAuthRejected, setHostAuthRejected] = useState(false);
   const pip = useCaptionPip();
   const poll = usePoll();
   const reactions = useReactions();
@@ -117,6 +118,7 @@ function HostInner() {
   const [routing, setRouting] = useState<Routing>('viewers');
   const [advancedAudioOpen, setAdvancedAudioOpen] = useState(false);
   const hasSession = session?.slug === slug;
+  const hostReady = hasSession && !hostAuthRejected;
 
   const sockRef = useRef<SessionSocket | null>(null);
   const micRef = useRef<MicCapture | null>(null);
@@ -189,7 +191,7 @@ function HostInner() {
   // Enumerating devices can expose permission UI in some browsers. Do not do
   // any device work until the requested session has been confirmed to exist.
   useEffect(() => {
-    if (!hasSession) return;
+    if (!hostReady) return;
     let active = true;
     void refreshAudioDevices(false)
       .then(({ inputs }) => {
@@ -201,15 +203,22 @@ function HostInner() {
     return () => {
       active = false;
     };
-  }, [hasSession, refreshAudioDevices, selectMicId]);
+  }, [hostReady, refreshAudioDevices, selectMicId]);
 
   // Host WS — authenticates with the admin key in the hello message.
   useEffect(() => {
-    if (!hasSession) return;
+    if (!hostReady) return;
     const sock = new SessionSocket(slug, 'host', auth || undefined);
     sock.onStatusChange = setWsConnected;
-    sock.onGaveUp = (code) =>
+    sock.onGaveUp = (code) => {
+      if (code === 4401) {
+        clearAdminKey();
+        setHostAuthRejected(true);
+        setTranslationError(null);
+        return;
+      }
       setTranslationError(`Lost connection to the server (code ${code}). Please reload this page.`);
+    };
     sock.onMessage = (msg) => {
       switch (msg.type) {
         case 'snapshot': {
@@ -287,7 +296,7 @@ function HostInner() {
       sock.close();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [auth, hasSession, slug]);
+  }, [auth, hostReady, slug]);
 
   // Mic graph: acquired in the lobby so the VU meter works before Start;
   // frames stream to the server only while state is 'live'.
@@ -321,13 +330,13 @@ function HostInner() {
   }, [refreshAudioDevices, selectMicId]);
 
   useEffect(() => {
-    if (!hasSession) return;
+    if (!hostReady) return;
     void ensureMic();
     return () => {
       micRef.current?.stop();
       micRef.current = null;
     };
-  }, [ensureMic, hasSession]);
+  }, [ensureMic, hostReady]);
 
   const recoverMic = useCallback(async (reason: string) => {
     const wasStreaming = micRef.current?.streaming ?? stateRef.current === 'live';
@@ -378,7 +387,7 @@ function HostInner() {
   // Refresh and recover when hardware changes. If the selected mic disappeared,
   // automatically fall back to the first available input and keep streaming.
   useEffect(() => {
-    if (!hasSession) return;
+    if (!hostReady) return;
     const md = navigator.mediaDevices;
     if (!md?.addEventListener) return;
     const refresh = () => {
@@ -386,7 +395,7 @@ function HostInner() {
     };
     md.addEventListener('devicechange', refresh);
     return () => md.removeEventListener('devicechange', refresh);
-  }, [hasSession, recoverMic]);
+  }, [hostReady, recoverMic]);
 
   useEffect(() => {
     micRef.current?.setMuted(micMuted);
@@ -596,7 +605,7 @@ function HostInner() {
   // Attendance analytics is intentionally low-frequency; live viewer count is
   // already provided over the host websocket.
   const refreshAnalytics = useCallback(async () => {
-    if (!hasSession || analyticsRefreshInFlightRef.current) return;
+    if (!hostReady || analyticsRefreshInFlightRef.current) return;
     analyticsRefreshInFlightRef.current = true;
     setAnalyticsRefreshing(true);
     try {
@@ -608,14 +617,14 @@ function HostInner() {
       analyticsRefreshInFlightRef.current = false;
       setAnalyticsRefreshing(false);
     }
-  }, [slug, auth, hasSession]);
+  }, [slug, auth, hostReady]);
 
   useEffect(() => {
-    if (!hasSession) return;
+    if (!hostReady) return;
     void refreshAnalytics();
     const id = window.setInterval(() => void refreshAnalytics(), ANALYTICS_REFRESH_MS);
     return () => clearInterval(id);
-  }, [hasSession, refreshAnalytics]);
+  }, [hostReady, refreshAnalytics]);
 
   // We route monitor/PA audio through a media element, so element setSinkId
   // counts too (broader support than AudioContext.setSinkId).
@@ -636,6 +645,26 @@ function HostInner() {
           >
             Back to presenter dashboard
           </Link>
+        </div>
+      </div>
+    );
+  }
+
+  if (hostAuthRejected) {
+    return (
+      <div className="bg-aurora flex min-h-screen items-center justify-center p-6 text-center">
+        <div className="glass-panel grad-border w-full max-w-md rounded-3xl p-8 shadow-2xl">
+          <h1 className="text-2xl font-semibold text-[var(--fg)]">Presenter key rejected</h1>
+          <p className="mt-3 text-[var(--muted)]">
+            Re-enter the presenter key to reconnect this host console.
+          </p>
+          <button
+            type="button"
+            onClick={() => window.location.reload()}
+            className="btn-primary mt-6 rounded-[var(--r-md)] px-5 py-2.5"
+          >
+            Re-enter presenter key
+          </button>
         </div>
       </div>
     );

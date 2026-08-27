@@ -14,8 +14,9 @@ export function checkAdminSecret(presented: string | undefined, secret: string):
 }
 
 /**
- * Fixed-window rate limiter for failed auth attempts: 5 failures/min per IP.
- * Successful auths do not count against the window.
+ * Fixed-window rate limiter for failed auth attempts: 5 failures/min per IP
+ * and surface. Successful auths do not count and are never blocked, so one
+ * venue NAT cannot lock out an operator who still has the correct key.
  */
 const WINDOW_MS = 60_000;
 const MAX_FAILURES = 5;
@@ -27,21 +28,29 @@ interface Window {
 
 const failures = new Map<string, Window>();
 
-export function isRateLimited(ip: string): boolean {
-  const w = failures.get(ip);
+export type AuthRateLimitScope = 'http' | 'host' | 'presenter';
+
+function failureKey(ip: string, scope: AuthRateLimitScope): string {
+  return `${scope}\u0000${ip}`;
+}
+
+export function isRateLimited(ip: string, scope: AuthRateLimitScope): boolean {
+  const key = failureKey(ip, scope);
+  const w = failures.get(key);
   if (!w) return false;
   if (Date.now() > w.resetAt) {
-    failures.delete(ip);
+    failures.delete(key);
     return false;
   }
   return w.count >= MAX_FAILURES;
 }
 
-export function recordAuthFailure(ip: string): void {
+export function recordAuthFailure(ip: string, scope: AuthRateLimitScope): void {
   const now = Date.now();
-  const w = failures.get(ip);
+  const key = failureKey(ip, scope);
+  const w = failures.get(key);
   if (!w || now > w.resetAt) {
-    failures.set(ip, { count: 1, resetAt: now + WINDOW_MS });
+    failures.set(key, { count: 1, resetAt: now + WINDOW_MS });
   } else {
     w.count += 1;
   }

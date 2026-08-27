@@ -149,13 +149,13 @@ function handleConnection(
       const payload = (msg.payload ?? {}) as HelloPayload;
 
       if (payload.role === 'host') {
-        if (isRateLimited(ip)) {
-          ws.close(4429, 'rate limited');
-          return;
-        }
         const ok = checkAdminSecret(payload.auth, adminSecret);
         if (!ok) {
-          recordAuthFailure(ip);
+          if (isRateLimited(ip, 'host')) {
+            ws.close(4429, 'rate limited');
+            return;
+          }
+          recordAuthFailure(ip, 'host');
           ws.close(4401, 'unauthorized');
           return;
         }
@@ -177,12 +177,14 @@ function handleConnection(
         // attempt. Ordinary viewers send no key, remain read-only, and never
         // consume the failed-auth budget.
         if (typeof payload.auth === 'string' && payload.auth.length > 0) {
-          if (isRateLimited(ip)) {
-            ws.close(4429, 'rate limited');
-            return;
-          }
           canPresent = checkAdminSecret(payload.auth, adminSecret);
-          if (!canPresent) recordAuthFailure(ip);
+          if (!canPresent) {
+            if (isRateLimited(ip, 'presenter')) {
+              ws.close(4429, 'rate limited');
+              return;
+            }
+            recordAuthFailure(ip, 'presenter');
+          }
         }
         role = 'viewer';
         room.viewers.add(ws);

@@ -7,6 +7,7 @@ import { createFixedWindow } from './rateLimit.js';
 import {
   createSession,
   completePendingSlideDeletion,
+  inspectDatabaseMaintenance,
   queuePendingSlideDeletion,
   getSessionBySlug,
   getTranscripts,
@@ -103,14 +104,14 @@ export function registerRoutes(app: FastifyInstance, env: Env, deps: RouteDeps):
   /** Admin guard: Bearer token, timing-safe compare, rate-limited failures. */
   function requireAdmin(req: FastifyRequest, reply: FastifyReply): boolean {
     const ip = clientIp(req);
-    if (isRateLimited(ip)) {
-      reply.code(429).send({ error: 'too many failed auth attempts, try again in a minute' });
-      return false;
-    }
     const header = req.headers.authorization ?? '';
     const token = header.startsWith('Bearer ') ? header.slice(7) : undefined;
     if (!checkAdminSecret(token, env.ADMIN_SECRET)) {
-      recordAuthFailure(ip);
+      if (isRateLimited(ip, 'http')) {
+        reply.code(429).send({ error: 'too many failed auth attempts, try again in a minute' });
+        return false;
+      }
+      recordAuthFailure(ip, 'http');
       reply.code(401).send({ error: 'unauthorized' });
       return false;
     }
@@ -281,7 +282,16 @@ export function registerRoutes(app: FastifyInstance, env: Env, deps: RouteDeps):
     try {
       getDb().prepare('SELECT 1').get();
       await fsp.access(env.UPLOADS_DIR, fs.constants.W_OK);
-      return { ok: true };
+      const maintenance = inspectDatabaseMaintenance();
+      const degraded = maintenance.pendingSlideDeletionCount > 0 || maintenance.compactionPending;
+      return {
+        ok: true,
+        maintenance: {
+          status: degraded ? 'degraded' : 'ok',
+          pendingSlideDeletions: maintenance.pendingSlideDeletionCount,
+          compactionPending: maintenance.compactionPending,
+        },
+      };
     } catch {
       reply.code(503).send({ ok: false });
     }

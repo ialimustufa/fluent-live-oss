@@ -1360,7 +1360,16 @@ if (!(await waitForHealth())) {
       health.headers.get('x-content-type-options') === 'nosniff',
     csp
   );
-  check('healthz verifies runtime dependencies', health.ok && healthBody?.ok === true);
+  check(
+    'healthz reports degraded maintenance without exposing queued refs',
+    health.ok &&
+      healthBody?.ok === true &&
+      healthBody?.maintenance?.status === 'degraded' &&
+      healthBody?.maintenance?.pendingSlideDeletions === 1 &&
+      healthBody?.maintenance?.compactionPending === false &&
+      !JSON.stringify(healthBody).includes('eeeeeeeeeeee'),
+    JSON.stringify(healthBody)
+  );
   await new Promise((resolve) => setTimeout(resolve, 150));
   const maintenanceDb = new Database(env.DATABASE_PATH);
   const pendingAfterBoot = maintenanceDb
@@ -1373,6 +1382,14 @@ if (!(await waitForHealth())) {
   check(
     'failed pending deck cleanup does not block health and remains durable',
     health.ok && pendingAfterBoot === 1
+  );
+  const healthyMaintenance = await (await fetch(`${BASE}/healthz`)).json();
+  check(
+    'healthz clears its degraded maintenance signal when queues are empty',
+    healthyMaintenance?.maintenance?.status === 'ok' &&
+      healthyMaintenance?.maintenance?.pendingSlideDeletions === 0 &&
+      healthyMaintenance?.maintenance?.compactionPending === false,
+    JSON.stringify(healthyMaintenance)
   );
 
   const retiredEndpoints = await Promise.all([
@@ -1738,19 +1755,32 @@ console.log('\n[9] WebSocket roles');
   audioHost.ws.close();
   await new Promise((r) => setTimeout(r, 300));
 
-  // Two failures were recorded above (invalid presenter + invalid host). Reach
-  // the five-failure boundary with nonempty presenter credentials, then prove
-  // the next attempt is rejected while ordinary display-only viewers remain
-  // outside the auth limiter.
-  for (let i = 0; i < 3; i++) {
+  // One presenter failure was recorded above. Reach its independent
+  // five-failure boundary, then prove invalid attempts are rejected while a
+  // correct venue key still succeeds and the Host budget remains separate.
+  for (let i = 0; i < 4; i++) {
     const invalidStage = await wsOpen(slug, { role: 'viewer', auth: `wrong-stage-key-${i}` });
     invalidStage.ws.close();
   }
   const limitedStage = await wsOpen(slug, { role: 'viewer', auth: 'wrong-stage-key-limited' });
   check(
-    'invalid presenter credentials share the per-IP auth rate limit',
+    'invalid presenter credentials use the presenter per-IP auth rate limit',
     limitedStage.closeCode() === 4429,
     `(close ${limitedStage.closeCode()})`
+  );
+  const validStageAfterFailures = await wsOpen(slug, { role: 'viewer', auth: SECRET });
+  check(
+    'a correct presenter key bypasses another attendee\'s failed-key budget',
+    validStageAfterFailures.messages.some(
+      (message) => message.type === 'snapshot' && message.payload.canPresent === true
+    )
+  );
+  validStageAfterFailures.ws.close();
+  const hostBudgetIsolated = await wsOpen(slug, { role: 'host', auth: 'another-wrong-host-key' });
+  check(
+    'Host and presenter failed-auth budgets are isolated behind venue NAT',
+    hostBudgetIsolated.closeCode() === 4401,
+    `(close ${hostBudgetIsolated.closeCode()})`
   );
 }
 

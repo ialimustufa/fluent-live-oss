@@ -473,6 +473,53 @@ try {
     JSON.stringify({ mediaCalls, hostAnalyticsRequests })
   );
 
+  const rejectedHost = await browser.newPage();
+  attachDiagnostics(rejectedHost, 'rejected-host');
+  await rejectedHost.route(`${BASE}/api/auth/check`, (route) =>
+    route.fulfill({ status: 200, contentType: 'application/json', body: '{"ok":true}' })
+  );
+  await rejectedHost.route(`${BASE}/api/sessions/${created.slug}/analytics`, (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        state: 'created',
+        live: 0,
+        uniqueAttendees: 0,
+        peakConcurrent: 0,
+        totalWatchMs: 0,
+        avgWatchMs: 0,
+        namedCount: 0,
+        attendeeListTruncated: false,
+        attendeeLimit: 500,
+        attendees: [],
+        reactions: {},
+      }),
+    })
+  );
+  await rejectedHost.goto(BASE, { waitUntil: 'domcontentloaded' });
+  await rejectedHost.evaluate(() => {
+    sessionStorage.setItem(
+      'fluent.adminKey',
+      JSON.stringify({ key: 'stale-host-key', expiresAt: Date.now() + 24 * 60 * 60 * 1000 })
+    );
+  });
+  await rejectedHost.goto(`${BASE}${created.hostPath}`, { waitUntil: 'domcontentloaded' });
+  await rejectedHost.getByRole('heading', { name: 'Presenter key rejected', exact: true }).waitFor();
+  const reenterHostKey = rejectedHost.getByRole('button', { name: 'Re-enter presenter key', exact: true });
+  check(
+    'Host 4401 directs the operator to re-enter the presenter key',
+    (await reenterHostKey.isVisible()) &&
+      (await rejectedHost.getByText('Re-enter the presenter key to reconnect this host console.', { exact: true }).isVisible())
+  );
+  await reenterHostKey.click();
+  await rejectedHost.getByRole('heading', { name: 'Presenter access', exact: true }).waitFor();
+  check(
+    'Host 4401 clears the stale key and reopens presenter access',
+    (await rejectedHost.evaluate(() => sessionStorage.getItem('fluent.adminKey'))) === null
+  );
+  await rejectedHost.close();
+
   phase = 'viewer';
   await page.goto(`${BASE}/${created.slug}/resource`, { waitUntil: 'networkidle' });
   await page.waitForURL(`${BASE}${created.viewerPath}`);
