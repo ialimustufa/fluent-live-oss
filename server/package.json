@@ -24,7 +24,7 @@
     "@aws-sdk/client-s3": "^3.1073.0",
     "@fastify/cors": "^10.0.1",
     "@fastify/helmet": "^13.0.2",
-    "@fastify/multipart": "^9.0.1",
+    "@fastify/multipart": "^10.1.1",
     "@fastify/static": "^10.1.3",
     "@google/genai": "^2.8.0",
     "better-sqlite3": "^12.10.0",
